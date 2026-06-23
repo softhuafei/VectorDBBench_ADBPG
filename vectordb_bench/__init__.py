@@ -1,0 +1,84 @@
+import inspect
+import pathlib
+
+import environs
+
+from . import log_util
+
+env = environs.Env()
+env.read_env(path=".env", recurse=False)
+
+
+class config:
+    ALIYUN_OSS_URL = "assets.zilliz.com.cn/benchmark/"
+    AWS_S3_URL = "assets.zilliz.com/benchmark/"
+
+    LOG_LEVEL = env.str("LOG_LEVEL", "INFO")
+    LOG_FILE = env.str("LOG_FILE", "logs/vectordb_bench.log")
+
+    DEFAULT_DATASET_URL = env.str("DEFAULT_DATASET_URL", AWS_S3_URL)
+    DATASET_SOURCE = env.str("DATASET_SOURCE", "S3")  # Options "S3" or "AliyunOSS"
+    DATASET_LOCAL_DIR = env.path("DATASET_LOCAL_DIR", "/tmp/vectordb_bench/dataset")
+    NUM_PER_BATCH = env.int("NUM_PER_BATCH", 100)
+    LOAD_CONCURRENCY = env.int("LOAD_CONCURRENCY", 0)  # 0 = cpu_count
+    TIME_PER_BATCH = 1  # 1s. for streaming insertion.
+    MAX_INSERT_RETRY = 5
+    MAX_SEARCH_RETRY = 5
+
+    LOAD_MAX_TRY_COUNT = 10
+
+    DROP_OLD = env.bool("DROP_OLD", True)
+    USE_SHUFFLED_DATA = env.bool("USE_SHUFFLED_DATA", True)
+
+    NUM_CONCURRENCY = env.list("NUM_CONCURRENCY", [1, 5, 10, 20, 30, 40, 60, 80], subcast=int)
+
+    CONCURRENCY_DURATION = 30
+
+    CONCURRENCY_TIMEOUT = 3600
+
+    RESULTS_LOCAL_DIR = env.path(
+        "RESULTS_LOCAL_DIR",
+        pathlib.Path(__file__).parent.joinpath("results"),
+    )
+    CONFIG_LOCAL_DIR = env.path(
+        "CONFIG_LOCAL_DIR",
+        pathlib.Path(__file__).parent.joinpath("config-files"),
+    )
+
+    K_DEFAULT = 100  # default return top k nearest neighbors during search
+    CUSTOM_CONFIG_DIR = pathlib.Path(__file__).parent.joinpath("custom/custom_case.json")
+
+    CAPACITY_TIMEOUT_IN_SECONDS = 24 * 3600  # 24h
+    LOAD_TIMEOUT_DEFAULT = 24 * 3600  # 24h
+    LOAD_TIMEOUT_768D_100K = 24 * 3600  # 24h
+    LOAD_TIMEOUT_768D_1M = 24 * 3600  # 24h
+    LOAD_TIMEOUT_768D_10M = 240 * 3600  # 10d
+    LOAD_TIMEOUT_768D_100M = 2400 * 3600  # 100d
+
+    LOAD_TIMEOUT_1536D_500K = 24 * 3600  # 24h
+    LOAD_TIMEOUT_1536D_5M = 240 * 3600  # 10d
+
+    LOAD_TIMEOUT_1024D_1M = 24 * 3600  # 24h
+    LOAD_TIMEOUT_1024D_10M = 240 * 3600  # 10d
+
+    OPTIMIZE_TIMEOUT_DEFAULT = 24 * 3600  # 24h
+    OPTIMIZE_TIMEOUT_768D_100K = 24 * 3600  # 24h
+    OPTIMIZE_TIMEOUT_768D_1M = 24 * 3600  # 24h
+    OPTIMIZE_TIMEOUT_768D_10M = 240 * 3600  # 10d
+    OPTIMIZE_TIMEOUT_768D_100M = 2400 * 3600  # 100d
+
+    OPTIMIZE_TIMEOUT_1536D_500K = 24 * 3600  # 24h
+    OPTIMIZE_TIMEOUT_1536D_5M = 240 * 3600  # 10d
+
+    OPTIMIZE_TIMEOUT_1024D_1M = 24 * 3600  # 24h
+    OPTIMIZE_TIMEOUT_1024D_10M = 240 * 3600  # 10d
+
+    def display(self) -> str:
+        return [
+            i
+            for i in inspect.getmembers(self)
+            if not inspect.ismethod(i[1]) and not i[0].startswith("_") and "TIMEOUT" not in i[0]
+        ]
+
+
+log_util.init(config.LOG_LEVEL, pathlib.Path(config.LOG_FILE))
