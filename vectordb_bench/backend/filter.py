@@ -1,5 +1,7 @@
 from enum import StrEnum
 
+from pydantic import Field
+
 from ..base import BaseModel
 
 
@@ -103,7 +105,7 @@ class ArrayContainsFilter(Filter):
 
     type: FilterOp = FilterOp.ArrayContains
     array_field: str = "user_array"
-    values: list[str] = []
+    values: list[str] = Field(default_factory=list)
 
     @property
     def rate_label(self) -> str:
@@ -124,7 +126,7 @@ class JoinArrayOverlapFilter(Filter):
     join_field: str = "pipeline_doc_id"
     tags_field: str = "tags"
     doc_table: str = "doc_table"
-    values: list[str] = []
+    values: list[str] = Field(default_factory=list)
 
     @property
     def rate_label(self) -> str:

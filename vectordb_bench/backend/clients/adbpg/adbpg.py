@@ -25,6 +25,11 @@ log = logging.getLogger(__name__)
 class Adbpg(VectorDB):
     """ADBPG vector database client, using psycopg."""
 
+    # psycopg Cursor is not thread-safe and the COPY protocol cannot be
+    # interleaved on a shared connection. Match PgVector/VectorChord and
+    # let ConcurrentInsertRunner clamp max_workers=1.
+    thread_safe: bool = False
+
     supported_filter_types: list[FilterOp] = [
         FilterOp.NonFilter,
         FilterOp.NumGE,
@@ -65,10 +70,11 @@ class Adbpg(VectorDB):
 
         self.where_clause = ""
 
-        # Hybrid-search state: schema flavor and EXPLAIN ANALYZE diagnostic buffer.
+        # Hybrid-search state: schema flavor.
         self.hybrid_mode = getattr(self.case_config, "hybrid_mode", "none")
-        self.explain_plans: list[dict] = []
-        self._explain_count = 0
+
+        if self.hybrid_mode == "join":
+            self.connect_config.pop("options", None)
 
         # construct basic units
         self.conn, self.cursor = self._create_connection(**self.connect_config)
@@ -153,7 +159,7 @@ class Adbpg(VectorDB):
             for setting in session_options:
                 command = sql.SQL("SET {setting_name} = {val};").format(
                     setting_name=sql.Identifier(setting["parameter"]["setting_name"]),
-                    val=sql.Identifier(str(setting["parameter"]["val"])),
+                    val=sql.Literal(str(setting["parameter"]["val"])),
                 )
                 log.debug(command.as_string(self.cursor))
                 self.cursor.execute(command)
@@ -268,10 +274,11 @@ class Adbpg(VectorDB):
         self._set_parallel_index_build_param()
 
         # Pre-build GUC: raise optimizer level before creating the ANN index.
-        # Bit 0 (THP loading) is intentionally cleared because the local
-        # adbpg7 instance does not have the sudoers rule needed for the kernel
-        # tmpfs mount; bit 1 (graph optimization) is preserved.
-        self.cursor.execute(sql.SQL("SET fastann.nova_build_optimize_level = 2;"))
+        self.cursor.execute(
+            sql.SQL("SET fastann.nova_build_optimize_level = {}").format(
+                sql.Literal(self.case_config.nova_build_optimize_level),
+            ),
+        )
         self.conn.commit()
 
         options = []
@@ -334,10 +341,12 @@ class Adbpg(VectorDB):
             if self.with_scalar_labels:
                 label_column = f", {self._scalar_label_field} VARCHAR(64)"
 
+            dist_clause = " DISTRIBUTED BY (id)" if self.hybrid_mode == "join" else ""
+
             create_sql = sql.SQL(
                 f"""
                 CREATE TABLE IF NOT EXISTS public.{{table_name}}
-                ({{primary_field}} BIGINT PRIMARY KEY, embedding vector({{dim}}){label_column}{''.join(extra_columns)});
+                ({{primary_field}} BIGINT PRIMARY KEY, embedding vector({{dim}}){label_column}{''.join(extra_columns)}){dist_clause};
                 """,
             ).format(
                 table_name=sql.Identifier(self.table_name),
@@ -369,7 +378,7 @@ class Adbpg(VectorDB):
         log.info(f"{self.name} create doc table {doc}")
         self.cursor.execute(
             sql.SQL(
-                "CREATE TABLE IF NOT EXISTS public.{doc} ({join_field} BIGINT PRIMARY KEY, {tags_field} TEXT[])",
+                "CREATE TABLE IF NOT EXISTS public.{doc} ({join_field} BIGINT PRIMARY KEY, {tags_field} TEXT[]) DISTRIBUTED BY ({join_field})",
             ).format(
                 doc=sql.Identifier(doc),
                 join_field=sql.Identifier(join_field),
@@ -502,6 +511,27 @@ class Adbpg(VectorDB):
             raise ValueError(msg)
 
         self._search = self._generate_search_query()
+        self._log_prettest_plan()
+
+    def _log_prettest_plan(self):
+        """Run EXPLAIN before real searches to show the chosen plan."""
+        try:
+            dummy_vec = np.zeros(self.dim, dtype=np.float32)
+            explain_sql = sql.SQL("EXPLAIN (COSTS OFF) ") + self._search
+            rows = self.cursor.execute(explain_sql, (dummy_vec, 10), prepare=False).fetchall()
+            plan_lines = [r[0] for r in rows]
+            log.info("=" * 60)
+            log.info("PRE-TEST EXECUTION PLAN:")
+            for line in plan_lines:
+                log.info(f"  {line}")
+            log.info("=" * 60)
+            self.conn.commit()
+        except Exception as e:
+            log.warning(f"Pre-test EXPLAIN failed: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def search_embedding(
         self,
@@ -515,22 +545,6 @@ class Adbpg(VectorDB):
 
         q = np.asarray(query)
 
-        if (
-            getattr(self.case_config, "enable_explain_analyze", False)
-            and self._explain_count < getattr(self.case_config, "explain_sample_size", 0)
-        ):
-            try:
-                explain_sql = sql.SQL("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ") + self._search
-                rows = self.cursor.execute(explain_sql, (q, k), prepare=False, binary=False).fetchall()
-                # Plan rows come back as a single-element list of JSON.
-                plan = rows[0][0] if rows else None
-                self.explain_plans.append({"query_idx": self._explain_count, "plan": plan})
-                self._persist_explain_plan(plan)
-                self._explain_count += 1
-            except Exception as e:  # pragma: no cover - diagnostic side-channel
-                log.warning(f"EXPLAIN capture failed: {e}")
-                self._explain_count += 1
-
         result = self.cursor.execute(
             self._search,
             (q, k),
@@ -538,22 +552,3 @@ class Adbpg(VectorDB):
             binary=True,
         )
         return [int(i[0]) for i in result.fetchall()]
-
-    def _persist_explain_plan(self, plan: Any) -> None:
-        """Append captured EXPLAIN ANALYZE JSON to a per-run jsonl file."""
-        try:
-            if not getattr(self, "_explain_log_path", None):
-                d = "/tmp/vdb_explain"
-                os.makedirs(d, exist_ok=True)
-                self._explain_log_path = os.path.join(
-                    d, f"{self.table_name}_{int(time.time())}.jsonl",
-                )
-            with open(self._explain_log_path, "a") as fh:
-                fh.write(json.dumps({
-                    "ts": time.time(),
-                    "table": self.table_name,
-                    "hybrid_mode": self.hybrid_mode,
-                    "plan": plan,
-                }) + "\n")
-        except Exception as e:
-            log.warning(f"persist EXPLAIN failed: {e}")

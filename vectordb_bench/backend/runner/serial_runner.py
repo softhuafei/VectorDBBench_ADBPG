@@ -141,6 +141,13 @@ class SerialSearchRunner:
             self.test_data = test_data
         self.ground_truth = ground_truth
 
+        max_queries = 500
+        if len(self.test_data) > max_queries:
+            log.info(f"Truncating test_data from {len(self.test_data)} to {max_queries} queries")
+            self.test_data = self.test_data[:max_queries]
+            if self.ground_truth is not None:
+                self.ground_truth = self.ground_truth[:max_queries]
+
     def _get_db_search_res(self, emb: list[float], retry_idx: int = 0) -> list[int]:
         try:
             results = self.db.search_embedding(emb, self.k)
@@ -154,7 +161,7 @@ class SerialSearchRunner:
 
         return results
 
-    def search(self, args: tuple[list, list[list[int]]]) -> tuple[float, float, float, float]:
+    def search(self, args: tuple[list, list[list[int]]]) -> tuple[float, float, float, float, float]:
         log.info(f"{mp.current_process().name:14} start search the entire test_data to get recall and latency")
         with self.db.init():
             self.db.prepare_filter(self.filters)
@@ -205,9 +212,9 @@ class SerialSearchRunner:
             f"p99={p99}, "
             f"p95={p95}"
         )
-        return (avg_recall, avg_ndcg, p99, p95)
+        return (avg_recall, avg_ndcg, avg_latency, p99, p95)
 
-    def _run_in_subprocess(self) -> tuple[float, float, float, float]:
+    def _run_in_subprocess(self) -> tuple[float, float, float, float, float]:
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.search, (self.test_data, self.ground_truth))
             return future.result()

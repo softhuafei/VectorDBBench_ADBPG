@@ -232,6 +232,7 @@ class TaskStage(StrEnum):
     LOAD = "load"
     SEARCH_SERIAL = "search_serial"
     SEARCH_CONCURRENT = "search_concurrent"
+    EXPLAIN_ONLY = "explain_only"
 
     def __repr__(self) -> str:
         return str.__repr__(self.value)

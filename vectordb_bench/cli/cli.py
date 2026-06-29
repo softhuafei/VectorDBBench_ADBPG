@@ -131,16 +131,22 @@ def parse_task_stages(
     load: bool,
     search_serial: bool,
     search_concurrent: bool,
+    explain_only: bool = False,
 ) -> list[TaskStage]:
     stages = []
     if load and not drop_old:
         raise RuntimeError("Dropping old data cannot be skipped if loading data")
     if drop_old and not load:
         raise RuntimeError("Load cannot be skipped if dropping old data")
+    if explain_only and (search_serial or search_concurrent):
+        raise RuntimeError("--explain-only is incompatible with --search-serial / --search-concurrent")
     if drop_old:
         stages.append(TaskStage.DROP_OLD)
     if load:
         stages.append(TaskStage.LOAD)
+    if explain_only:
+        stages.append(TaskStage.EXPLAIN_ONLY)
+        return stages
     if search_serial:
         stages.append(TaskStage.SEARCH_SERIAL)
     if search_concurrent:
@@ -149,7 +155,11 @@ def parse_task_stages(
 
 
 def check_custom_case_parameters(ctx: any, param: any, value: any):  # noqa: ARG001
-    if ctx.params.get("case_type") == "PerformanceCustomDataset" and value is None:
+    if ctx.params.get("case_type") in (
+        "PerformanceCustomDataset",
+        "HybridArrayPerformanceCase",
+        "HybridJoinPerformanceCase",
+    ) and value is None:
         raise click.BadParameter(
             """ Custom case parameters
 --custom-case-name
@@ -278,6 +288,16 @@ class CommonTypedDict(TypedDict):
             type=bool,
             default=True,
             help="Search concurrent or skip",
+            show_default=True,
+        ),
+    ]
+    explain_only: Annotated[
+        bool,
+        click.option(
+            "--explain-only/--no-explain-only",
+            type=bool,
+            default=False,
+            help="Run prepare_filter only (emits EXPLAIN via the client's pre-test plan logger) and skip the real search loop. Implies --skip-search-serial and --skip-search-concurrent.",
             show_default=True,
         ),
     ]
@@ -682,6 +702,7 @@ def run(
             parameters["load"],
             parameters["search_serial"],
             parameters["search_concurrent"],
+            parameters.get("explain_only", False),
         ),
         load_concurrency=parameters["load_concurrency"],
     )

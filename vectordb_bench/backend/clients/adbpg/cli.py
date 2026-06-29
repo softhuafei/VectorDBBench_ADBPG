@@ -45,11 +45,11 @@ class AdbpgTypedDict(CommonTypedDict):
     db_name: Annotated[str, click.option("--db-name", type=str, help="Db name", required=True)]
     hnsw_m: Annotated[
         int,
-        click.option("--hnsw-m", type=int, help="hnsw_m", default=16, show_default=True, required=False),
+        click.option("--hnsw-m", type=int, help="hnsw_m", default=48, show_default=True, required=False),
     ]
     ef_search: Annotated[
         int,
-        click.option("--ef-search", type=int, help="ef_search", default=100, show_default=True, required=False),
+        click.option("--ef-search", type=int, help="ef_search", default=150, show_default=True, required=False),
     ]
     ef_construction: Annotated[
         int,
@@ -57,7 +57,7 @@ class AdbpgTypedDict(CommonTypedDict):
             "--ef-construction",
             type=int,
             help="ef_construction",
-            default=200,
+            default=600,
             show_default=True,
             required=False,
         ),
@@ -76,7 +76,7 @@ class AdbpgTypedDict(CommonTypedDict):
             "--quantize-rescore-amp",
             type=float,
             help="fastann.quantize_rescore_amp",
-            default=1.0,
+            default=0.0,
             show_default=True,
             required=False,
         ),
@@ -110,7 +110,7 @@ class AdbpgTypedDict(CommonTypedDict):
             "--max-scan-points",
             type=int,
             help="max_scan_points",
-            default=2000,
+            default=20000,
             show_default=True,
             required=False,
         ),
@@ -168,6 +168,28 @@ class AdbpgTypedDict(CommonTypedDict):
             required=False,
         ),
     ]
+    topk_amp: Annotated[
+        int,
+        click.option(
+            "--topk-amp",
+            type=int,
+            help="fastann.topk_amp: novad IVF candidate amplification factor",
+            default=10,
+            show_default=True,
+            required=False,
+        ),
+    ]
+    nova_build_optimize_level: Annotated[
+        int,
+        click.option(
+            "--nova-build-optimize-level",
+            type=int,
+            help="fastann.nova_build_optimize_level: 3=THP+graph opt (needs /mnt/nova_thp), 2=graph opt only (local dev)",
+            default=3,
+            show_default=True,
+            required=False,
+        ),
+    ]
     hybrid_mode: Annotated[
         str,
         click.option(
@@ -175,29 +197,6 @@ class AdbpgTypedDict(CommonTypedDict):
             type=click.Choice(["none", "array", "join"]),
             help="Hybrid-search schema flavor",
             default="none",
-            show_default=True,
-            required=False,
-        ),
-    ]
-    enable_explain_analyze: Annotated[
-        bool,
-        click.option(
-            "--enable-explain-analyze/--no-enable-explain-analyze",
-            "enable_explain_analyze",
-            type=bool,
-            help="Capture EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) for the first N search queries",
-            default=False,
-            show_default=True,
-            required=False,
-        ),
-    ]
-    explain_sample_size: Annotated[
-        int,
-        click.option(
-            "--explain-sample-size",
-            type=int,
-            help="Number of search queries to capture EXPLAIN for",
-            default=5,
             show_default=True,
             required=False,
         ),
@@ -224,24 +223,16 @@ class AdbpgTypedDict(CommonTypedDict):
             required=False,
         ),
     ]
-    hybrid_brute_force_threshold: Annotated[
-        float,
-        click.option(
-            "--hybrid-brute-force-threshold",
-            type=float,
-            help="adbpg_fastann_hybrid_brute_force_selectivity_threshold: 0.1 forces GIN+Sort for all selectivities",
-            default=0.001,
-            show_default=True,
-            required=False,
-        ),
-    ]
-    enable_bitmap_pushdown: Annotated[
+    force_plan: Annotated[
         str,
         click.option(
-            "--enable-bitmap-pushdown",
-            type=click.Choice(["on", "off"]),
-            help="adbpg_enable_fastann_hybrid_bitmap_pushdown: off forces post-filter (with expression) path",
-            default="on",
+            "--force-plan",
+            type=click.Choice(["auto", "brute_force", "bitmap_pushdown", "expression", "post_filter"]),
+            help=(
+                "Force one of the 4 verified hybrid plan recipes (validated across 5 "
+                "selectivity rates on 1M and 10M). auto = let planner decide."
+            ),
+            default="auto",
             show_default=True,
             required=False,
         ),
@@ -278,13 +269,12 @@ def AdbpgNova(**parameters: Unpack[AdbpgTypedDict]):
             max_scan_points=parameters["max_scan_points"],
             index_scan_mode=parameters["index_scan_mode"],
             nprobe=parameters["nprobe"],
+            topk_amp=parameters["topk_amp"],
+            nova_build_optimize_level=parameters["nova_build_optimize_level"],
             hybrid_mode=parameters["hybrid_mode"],
-            enable_explain_analyze=parameters["enable_explain_analyze"],
-            explain_sample_size=parameters["explain_sample_size"],
             nova_topk_amp_mul=parameters["nova_topk_amp_mul"],
             nova_topk_amp_add=parameters["nova_topk_amp_add"],
-            hybrid_brute_force_threshold=parameters["hybrid_brute_force_threshold"],
-            enable_bitmap_pushdown=parameters["enable_bitmap_pushdown"],
+            force_plan=parameters["force_plan"],
         ),
         **parameters,
     )
