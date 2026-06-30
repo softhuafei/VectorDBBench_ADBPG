@@ -168,6 +168,75 @@ class AdbpgTypedDict(CommonTypedDict):
             required=False,
         ),
     ]
+    topk_amp: Annotated[
+        int,
+        click.option(
+            "--topk-amp",
+            type=int,
+            help="fastann.topk_amp: novad IVF candidate amplification factor",
+            default=10,
+            show_default=True,
+            required=False,
+        ),
+    ]
+    nova_build_optimize_level: Annotated[
+        int,
+        click.option(
+            "--nova-build-optimize-level",
+            type=int,
+            help="fastann.nova_build_optimize_level: 3=THP+graph opt (needs /mnt/nova_thp), 2=graph opt only (local dev)",
+            default=3,
+            show_default=True,
+            required=False,
+        ),
+    ]
+    hybrid_mode: Annotated[
+        str,
+        click.option(
+            "--hybrid-mode",
+            type=click.Choice(["none", "array", "join"]),
+            help="Hybrid-search schema flavor",
+            default="none",
+            show_default=True,
+            required=False,
+        ),
+    ]
+    nova_topk_amp_mul: Annotated[
+        float,
+        click.option(
+            "--nova-topk-amp-mul",
+            type=float,
+            help="fastann.nova_topk_amp_mul (bitmap push-down path scan amplification multiplier)",
+            default=1.0,
+            show_default=True,
+            required=False,
+        ),
+    ]
+    nova_topk_amp_add: Annotated[
+        float,
+        click.option(
+            "--nova-topk-amp-add",
+            type=float,
+            help="fastann.nova_topk_amp_add (bitmap push-down path scan amplification addend)",
+            default=0.0,
+            show_default=True,
+            required=False,
+        ),
+    ]
+    force_plan: Annotated[
+        str,
+        click.option(
+            "--force-plan",
+            type=click.Choice(["auto", "brute_force", "bitmap_pushdown", "expression", "post_filter"]),
+            help=(
+                "Force one of the 4 verified hybrid plan recipes (validated across 5 "
+                "selectivity rates on 1M and 10M). auto = let planner decide."
+            ),
+            default="auto",
+            show_default=True,
+            required=False,
+        ),
+    ]
 
 
 @cli.command()
@@ -200,6 +269,12 @@ def AdbpgNova(**parameters: Unpack[AdbpgTypedDict]):
             max_scan_points=parameters["max_scan_points"],
             index_scan_mode=parameters["index_scan_mode"],
             nprobe=parameters["nprobe"],
+            topk_amp=parameters["topk_amp"],
+            nova_build_optimize_level=parameters["nova_build_optimize_level"],
+            hybrid_mode=parameters["hybrid_mode"],
+            nova_topk_amp_mul=parameters["nova_topk_amp_mul"],
+            nova_topk_amp_add=parameters["nova_topk_amp_add"],
+            force_plan=parameters["force_plan"],
         ),
         **parameters,
     )

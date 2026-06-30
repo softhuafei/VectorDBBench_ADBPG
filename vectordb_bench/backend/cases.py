@@ -4,7 +4,17 @@ from enum import Enum, auto
 
 from vectordb_bench import config
 from vectordb_bench.backend.clients.api import MetricType
-from vectordb_bench.backend.filter import Filter, FilterOp, IntFilter, LabelFilter, NewIntFilter, NonFilter, non_filter
+from vectordb_bench.backend.filter import (
+    ArrayContainsFilter,
+    Filter,
+    FilterOp,
+    IntFilter,
+    JoinArrayOverlapFilter,
+    LabelFilter,
+    NewIntFilter,
+    NonFilter,
+    non_filter,
+)
 from vectordb_bench.base import BaseModel
 from vectordb_bench.frontend.components.custom.getCustomConfig import CustomDatasetConfig
 
@@ -56,6 +66,9 @@ class CaseType(Enum):
     LabelFilterPerformanceCase = 300
 
     NewIntFilterPerformanceCase = 400
+
+    HybridArrayPerformanceCase = 500
+    HybridJoinPerformanceCase = 501
 
     def case_cls(self, custom_configs: dict | None = None) -> type["Case"]:
         if custom_configs is None:
@@ -631,6 +644,74 @@ class LabelFilterPerformanceCase(PerformanceCase):
         return LabelFilter(label_percentage=self.label_percentage)
 
 
+def _rate_marker_token(rate: float) -> str:
+    for d in (2, 10, 100, 1_000, 10_000):
+        if abs(rate - 1.0 / d) < 1e-9:
+            return f"r_{d}"
+    msg = f"unsupported hybrid_rate {rate}; expected one of 0.5/0.1/0.01/0.001/0.0001"
+    raise ValueError(msg)
+
+
+class HybridArrayPerformanceCase(PerformanceCustomDataset):
+    case_id: CaseType = CaseType.HybridArrayPerformanceCase
+    name: str = "Hybrid Array Filter (Custom Dataset)"
+    hybrid_rate: float = 0.01
+    array_field: str = "user_array"
+
+    def __init__(
+        self,
+        hybrid_rate: float,
+        array_field: str = "user_array",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        # Pydantic v2 requires using object.__setattr__ to set fields after init
+        # if they aren't already declared in kwargs handled by the parent.
+        self.hybrid_rate = hybrid_rate
+        self.array_field = array_field
+
+    @property
+    def filters(self) -> Filter:
+        return ArrayContainsFilter(
+            filter_rate=self.hybrid_rate,
+            array_field=self.array_field,
+            values=[_rate_marker_token(self.hybrid_rate)],
+        )
+
+
+class HybridJoinPerformanceCase(PerformanceCustomDataset):
+    case_id: CaseType = CaseType.HybridJoinPerformanceCase
+    name: str = "Hybrid 2-Table Join Filter (Custom Dataset)"
+    hybrid_rate: float = 0.01
+    join_field: str = "pipeline_doc_id"
+    tags_field: str = "tags"
+    doc_table: str = "doc_table"
+
+    def __init__(
+        self,
+        hybrid_rate: float,
+        join_field: str = "pipeline_doc_id",
+        tags_field: str = "tags",
+        doc_table: str = "doc_table",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.hybrid_rate = hybrid_rate
+        self.join_field = join_field
+        self.tags_field = tags_field
+        self.doc_table = doc_table
+
+    @property
+    def filters(self) -> Filter:
+        return JoinArrayOverlapFilter(
+            filter_rate=self.hybrid_rate,
+            join_field=self.join_field,
+            tags_field=self.tags_field,
+            doc_table=self.doc_table,
+            values=[_rate_marker_token(self.hybrid_rate)],
+        )
+
+
 type2case = {
     CaseType.CapacityDim960: CapacityDim960,
     CaseType.CapacityDim128: CapacityDim128,
@@ -655,4 +736,6 @@ type2case = {
     CaseType.StreamingCustomDataset: StreamingCustomDataset,
     CaseType.NewIntFilterPerformanceCase: NewIntFilterPerformanceCase,
     CaseType.LabelFilterPerformanceCase: LabelFilterPerformanceCase,
+    CaseType.HybridArrayPerformanceCase: HybridArrayPerformanceCase,
+    CaseType.HybridJoinPerformanceCase: HybridJoinPerformanceCase,
 }

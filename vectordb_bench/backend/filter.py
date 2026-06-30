@@ -1,5 +1,7 @@
 from enum import StrEnum
 
+from pydantic import Field
+
 from ..base import BaseModel
 
 
@@ -7,6 +9,8 @@ class FilterOp(StrEnum):
     NumGE = "NumGE"  # test ">="
     StrEqual = "Label"  # test "=="
     NonFilter = "NonFilter"
+    ArrayContains = "ArrayContains"  # GIN @> on a single-table array column
+    JoinArrayOverlap = "JoinArrayOverlap"  # subquery IN (SELECT ... WHERE tags && ARRAY[...])
 
 
 class Filter(BaseModel):
@@ -91,3 +95,46 @@ class LabelFilter(Filter):
     @property
     def groundtruth_file(self) -> str:
         return f"neighbors_{self.label_field}_{self.label_value}.parquet"
+
+
+class ArrayContainsFilter(Filter):
+    """Single-table GIN array containment predicate.
+
+    Filter expression: <array_field> @> ARRAY[<values>]
+    """
+
+    type: FilterOp = FilterOp.ArrayContains
+    array_field: str = "user_array"
+    values: list[str] = Field(default_factory=list)
+
+    @property
+    def rate_label(self) -> str:
+        r = self.filter_rate * 100
+        if r >= 1:
+            return f"{int(r)}p"
+        return f"{r:.2f}p"
+
+    @property
+    def groundtruth_file(self) -> str:
+        return f"neighbors_array_{self.rate_label}.parquet"
+
+
+class JoinArrayOverlapFilter(Filter):
+    """Two-table JOIN predicate: chunk.<join_field> IN (SELECT <join_field> FROM doc WHERE <tags_field> && ARRAY[<values>])."""
+
+    type: FilterOp = FilterOp.JoinArrayOverlap
+    join_field: str = "pipeline_doc_id"
+    tags_field: str = "tags"
+    doc_table: str = "doc_table"
+    values: list[str] = Field(default_factory=list)
+
+    @property
+    def rate_label(self) -> str:
+        r = self.filter_rate * 100
+        if r >= 1:
+            return f"{int(r)}p"
+        return f"{r:.2f}p"
+
+    @property
+    def groundtruth_file(self) -> str:
+        return f"neighbors_join_{self.rate_label}.parquet"

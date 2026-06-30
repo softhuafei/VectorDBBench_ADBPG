@@ -208,6 +208,11 @@ class CaseRunner(BaseModel):
                     )
                 else:
                     log.info("Data loading skipped")
+            if TaskStage.EXPLAIN_ONLY in self.config.stages:
+                log.info("EXPLAIN_ONLY stage: running prepare_filter to emit the pre-test plan, skipping search")
+                with self.db.init():
+                    self.db.prepare_filter(self.ca.filters)
+                return m
             if TaskStage.SEARCH_SERIAL in self.config.stages or TaskStage.SEARCH_CONCURRENT in self.config.stages:
                 self._init_search_runner()
                 if TaskStage.SEARCH_CONCURRENT in self.config.stages:
@@ -222,7 +227,7 @@ class CaseRunner(BaseModel):
                     ) = search_results
                 if TaskStage.SEARCH_SERIAL in self.config.stages:
                     search_results = self._serial_search()
-                    m.recall, m.ndcg, m.serial_latency_p99, m.serial_latency_p95 = search_results
+                    m.recall, m.ndcg, m.serial_latency_avg, m.serial_latency_p99, m.serial_latency_p95 = search_results
 
         except Exception as e:
             log.warning(f"Failed to run performance case, reason = {e}")

@@ -1,6 +1,9 @@
 """Wrapper around the Aliyun ADBPG (AnalyticDB for PostgreSQL) vector database."""
 
+import json
 import logging
+import os
+import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -13,6 +16,7 @@ from psycopg import Connection, Cursor, sql
 from vectordb_bench.backend.filter import Filter, FilterOp
 
 from ..api import VectorDB
+from . import hybrid_synth
 from .config import AdbpgConfigDict, AdbpgIndexConfig
 
 log = logging.getLogger(__name__)
@@ -30,6 +34,8 @@ class Adbpg(VectorDB):
         FilterOp.NonFilter,
         FilterOp.NumGE,
         FilterOp.StrEqual,
+        FilterOp.ArrayContains,
+        FilterOp.JoinArrayOverlap,
     ]
 
     conn: psycopg.Connection[Any] | None = None
@@ -64,6 +70,12 @@ class Adbpg(VectorDB):
 
         self.where_clause = ""
 
+        # Hybrid-search state: schema flavor.
+        self.hybrid_mode = getattr(self.case_config, "hybrid_mode", "none")
+
+        if self.hybrid_mode == "join":
+            self.connect_config.pop("options", None)
+
         # construct basic units
         self.conn, self.cursor = self._create_connection(**self.connect_config)
 
@@ -84,7 +96,10 @@ class Adbpg(VectorDB):
         if drop_old:
             self._drop_index()
             self._drop_table()
+            if self.hybrid_mode == "join":
+                self._drop_doc_table()
             self._create_table(dim)
+            self._create_hybrid_aux_indexes()
             if self.case_config.create_index_before_load:
                 self._create_index()
 
@@ -144,7 +159,7 @@ class Adbpg(VectorDB):
             for setting in session_options:
                 command = sql.SQL("SET {setting_name} = {val};").format(
                     setting_name=sql.Identifier(setting["parameter"]["setting_name"]),
-                    val=sql.Identifier(str(setting["parameter"]["val"])),
+                    val=sql.Literal(str(setting["parameter"]["val"])),
                 )
                 log.debug(command.as_string(self.cursor))
                 self.cursor.execute(command)
@@ -171,13 +186,55 @@ class Adbpg(VectorDB):
         self.conn.commit()
 
     def optimize(self, data_size: int | None = None):
+        if self.hybrid_mode == "join":
+            self._populate_doc_table()
         self._post_insert()
+
+    def _populate_doc_table(self):
+        assert self.conn is not None
+        assert self.cursor is not None
+        doc = self.case_config.doc_table_name
+        join_field = self.case_config.doc_join_field
+        tags_field = self.case_config.doc_tags_field
+        log.info(f"{self.name} populate doc table {doc}")
+        # Clear and refill so reruns are idempotent.
+        self.cursor.execute(sql.SQL("TRUNCATE TABLE public.{doc}").format(doc=sql.Identifier(doc)))
+        rows = self.cursor.execute(
+            sql.SQL("SELECT DISTINCT {col} FROM public.{tbl}").format(
+                col=sql.Identifier(join_field),
+                tbl=sql.Identifier(self.table_name),
+            ),
+        ).fetchall()
+        with self.cursor.copy(
+            sql.SQL("COPY public.{doc} ({jf}, {tf}) FROM STDIN (FORMAT BINARY)").format(
+                doc=sql.Identifier(doc),
+                jf=sql.Identifier(join_field),
+                tf=sql.Identifier(tags_field),
+            ),
+        ) as copy:
+            copy.set_types(["bigint", 1009])
+            for r in rows:
+                doc_id = int(r[0])
+                copy.write_row((doc_id, hybrid_synth.doc_tags_for(doc_id)))
+        self.conn.commit()
 
     def _post_insert(self):
         log.info(f"{self.name} post insert before optimize")
         if self.case_config.create_index_after_load:
             self._drop_index()
             self._create_index()
+        self._analyze_tables()
+
+    def _analyze_tables(self):
+        assert self.conn is not None, "Connection is not initialized"
+        assert self.cursor is not None, "Cursor is not initialized"
+        tables = [self.table_name]
+        if self.hybrid_mode == "join":
+            tables.append(self.case_config.doc_table_name)
+        for tbl in tables:
+            log.info(f"{self.name} analyze table : {tbl}")
+            self.cursor.execute(sql.SQL("ANALYZE {tbl}").format(tbl=sql.Identifier(tbl)))
+            self.conn.commit()
 
     def _drop_index(self):
         assert self.conn is not None, "Connection is not initialized"
@@ -217,7 +274,11 @@ class Adbpg(VectorDB):
         self._set_parallel_index_build_param()
 
         # Pre-build GUC: raise optimizer level before creating the ANN index.
-        self.cursor.execute(sql.SQL("SET fastann.nova_build_optimize_level = 3;"))
+        self.cursor.execute(
+            sql.SQL("SET fastann.nova_build_optimize_level = {}").format(
+                sql.Literal(self.case_config.nova_build_optimize_level),
+            ),
+        )
         self.conn.commit()
 
         options = []
@@ -265,45 +326,120 @@ class Adbpg(VectorDB):
         assert self.cursor is not None, "Cursor is not initialized"
 
         try:
-            log.info(f"{self.name} client create table : {self.table_name}")
+            log.info(f"{self.name} client create table : {self.table_name} (hybrid_mode={self.hybrid_mode})")
 
+            extra_columns: list[str] = []
+            if self.hybrid_mode == "array":
+                # Single-table model: GIN array column + scalar pipeline_id (btree).
+                extra_columns.append(f", {self.case_config.array_field} TEXT[]")
+                extra_columns.append(", pipeline_id TEXT")
+            elif self.hybrid_mode == "join":
+                # Two-table model: chunk table carries the pipeline_doc_id FK.
+                extra_columns.append(f", {self.case_config.doc_join_field} BIGINT")
+
+            label_column = ""
             if self.with_scalar_labels:
-                self.cursor.execute(
-                    sql.SQL(
-                        """
-                        CREATE TABLE IF NOT EXISTS public.{table_name}
-                        ({primary_field} BIGINT PRIMARY KEY, embedding vector({dim}), {label_field} VARCHAR(64));
-                        """,
-                    ).format(
-                        table_name=sql.Identifier(self.table_name),
-                        primary_field=sql.Identifier(self._primary_field),
-                        dim=dim,
-                        label_field=sql.Identifier(self._scalar_label_field),
-                    ),
-                )
-            else:
-                self.cursor.execute(
-                    sql.SQL(
-                        """
-                        CREATE TABLE IF NOT EXISTS public.{table_name}
-                        ({primary_field} BIGINT PRIMARY KEY, embedding vector({dim}));
-                        """,
-                    ).format(
-                        table_name=sql.Identifier(self.table_name),
-                        primary_field=sql.Identifier(self._primary_field),
-                        dim=dim,
-                    ),
-                )
+                label_column = f", {self._scalar_label_field} VARCHAR(64)"
+
+            dist_clause = " DISTRIBUTED BY (id)" if self.hybrid_mode == "join" else ""
+
+            create_sql = sql.SQL(
+                f"""
+                CREATE TABLE IF NOT EXISTS public.{{table_name}}
+                ({{primary_field}} BIGINT PRIMARY KEY, embedding vector({{dim}}){label_column}{''.join(extra_columns)}){dist_clause};
+                """,
+            ).format(
+                table_name=sql.Identifier(self.table_name),
+                primary_field=sql.Identifier(self._primary_field),
+                dim=dim,
+            )
+            self.cursor.execute(create_sql)
 
             self.cursor.execute(
                 sql.SQL(
                     "ALTER TABLE public.{table_name} ALTER COLUMN embedding SET STORAGE PLAIN;",
                 ).format(table_name=sql.Identifier(self.table_name)),
             )
+
+            if self.hybrid_mode == "join":
+                self._create_doc_table()
+
             self.conn.commit()
         except Exception as e:
             log.warning(f"Failed to create adbpg table: {self.table_name} error: {e}")
             raise e from None
+
+    def _create_doc_table(self):
+        """Create the doc-side table for the 2-table JOIN scenario."""
+        assert self.cursor is not None
+        doc = self.case_config.doc_table_name
+        join_field = self.case_config.doc_join_field
+        tags_field = self.case_config.doc_tags_field
+        log.info(f"{self.name} create doc table {doc}")
+        self.cursor.execute(
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS public.{doc} ({join_field} BIGINT PRIMARY KEY, {tags_field} TEXT[]) DISTRIBUTED BY ({join_field})",
+            ).format(
+                doc=sql.Identifier(doc),
+                join_field=sql.Identifier(join_field),
+                tags_field=sql.Identifier(tags_field),
+            ),
+        )
+
+    def _drop_doc_table(self):
+        assert self.cursor is not None
+        doc = self.case_config.doc_table_name
+        log.info(f"{self.name} drop doc table {doc}")
+        self.cursor.execute(
+            sql.SQL("DROP TABLE IF EXISTS public.{doc}").format(doc=sql.Identifier(doc)),
+        )
+        self.conn.commit()
+
+    def _create_hybrid_aux_indexes(self):
+        """Create GIN indexes on hybrid columns (one-time, after table create, before load)."""
+        if self.hybrid_mode == "none":
+            return
+        assert self.conn is not None
+        assert self.cursor is not None
+        if self.hybrid_mode == "array":
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} USING gin ({col})",
+                ).format(
+                    idx=sql.Identifier(f"{self.table_name}_{self.case_config.array_field}_gin"),
+                    tbl=sql.Identifier(self.table_name),
+                    col=sql.Identifier(self.case_config.array_field),
+                ),
+            )
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} (pipeline_id)",
+                ).format(
+                    idx=sql.Identifier(f"{self.table_name}_pipeline_id_btree"),
+                    tbl=sql.Identifier(self.table_name),
+                ),
+            )
+        elif self.hybrid_mode == "join":
+            doc = self.case_config.doc_table_name
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{doc} USING gin ({col})",
+                ).format(
+                    idx=sql.Identifier(f"{doc}_{self.case_config.doc_tags_field}_gin"),
+                    doc=sql.Identifier(doc),
+                    col=sql.Identifier(self.case_config.doc_tags_field),
+                ),
+            )
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} ({col})",
+                ).format(
+                    idx=sql.Identifier(f"{self.table_name}_{self.case_config.doc_join_field}_btree"),
+                    tbl=sql.Identifier(self.table_name),
+                    col=sql.Identifier(self.case_config.doc_join_field),
+                ),
+            )
+        self.conn.commit()
 
     def insert_embeddings(
         self,
@@ -321,18 +457,32 @@ class Adbpg(VectorDB):
             metadata_arr = np.array(metadata)
             embeddings_arr = np.array(embeddings)
 
+            base_types: list[Any] = ["bigint", "vector"]
+            if self.with_scalar_labels:
+                base_types.append("varchar")
+            if self.hybrid_mode == "array":
+                # 1009 = text[] (psycopg registry has no '_text' alias).
+                base_types.extend([1009, "text"])
+            elif self.hybrid_mode == "join":
+                base_types.append("bigint")
+
             with self.cursor.copy(
                 sql.SQL("COPY public.{table_name} FROM STDIN (FORMAT BINARY)").format(
                     table_name=sql.Identifier(self.table_name),
                 ),
             ) as copy:
+                copy.set_types(base_types)
                 for i, row in enumerate(metadata_arr):
+                    rid = int(row)
+                    values: list[Any] = [rid, embeddings_arr[i]]
                     if self.with_scalar_labels:
-                        copy.set_types(["bigint", "vector", "varchar"])
-                        copy.write_row((row, embeddings_arr[i], labels_data[i]))
-                    else:
-                        copy.set_types(["bigint", "vector"])
-                        copy.write_row((row, embeddings_arr[i]))
+                        values.append(labels_data[i])
+                    if self.hybrid_mode == "array":
+                        values.append(hybrid_synth.user_array_for(rid))
+                        values.append(hybrid_synth.pipeline_id_for(rid))
+                    elif self.hybrid_mode == "join":
+                        values.append(hybrid_synth.pipeline_doc_id_for(rid))
+                    copy.write_row(tuple(values))
             self.conn.commit()
 
             return len(metadata), None
@@ -347,11 +497,41 @@ class Adbpg(VectorDB):
             self.where_clause = f"WHERE {self._primary_field} >= {filters.int_value}"
         elif filters.type == FilterOp.StrEqual:
             self.where_clause = f"WHERE {self._scalar_label_field} = '{filters.label_value}'"
+        elif filters.type == FilterOp.ArrayContains:
+            vals = ",".join(f"'{v}'" for v in filters.values)
+            self.where_clause = f"WHERE {filters.array_field} @> ARRAY[{vals}]::text[]"
+        elif filters.type == FilterOp.JoinArrayOverlap:
+            vals = ",".join(f"'{v}'" for v in filters.values)
+            self.where_clause = (
+                f"WHERE {filters.join_field} IN (SELECT {filters.join_field} FROM public.{filters.doc_table} "
+                f"WHERE {filters.tags_field} && ARRAY[{vals}]::text[])"
+            )
         else:
             msg = f"Not support Filter for Adbpg - {filters}"
             raise ValueError(msg)
 
         self._search = self._generate_search_query()
+        self._log_prettest_plan()
+
+    def _log_prettest_plan(self):
+        """Run EXPLAIN before real searches to show the chosen plan."""
+        try:
+            dummy_vec = np.zeros(self.dim, dtype=np.float32)
+            explain_sql = sql.SQL("EXPLAIN (COSTS OFF) ") + self._search
+            rows = self.cursor.execute(explain_sql, (dummy_vec, 10), prepare=False).fetchall()
+            plan_lines = [r[0] for r in rows]
+            log.info("=" * 60)
+            log.info("PRE-TEST EXECUTION PLAN:")
+            for line in plan_lines:
+                log.info(f"  {line}")
+            log.info("=" * 60)
+            self.conn.commit()
+        except Exception as e:
+            log.warning(f"Pre-test EXPLAIN failed: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
 
     def search_embedding(
         self,
@@ -364,6 +544,7 @@ class Adbpg(VectorDB):
         assert self.cursor is not None, "Cursor is not initialized"
 
         q = np.asarray(query)
+
         result = self.cursor.execute(
             self._search,
             (q, k),

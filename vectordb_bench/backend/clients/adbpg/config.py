@@ -64,8 +64,32 @@ class AdbpgIndexConfig(BaseModel, DBCaseConfig):
     index_scan_mode: str = "snapshot"
     auto_reduction: bool = False
     pca_dim: int | None = None
-    # novad-specific search param (no-op for novamr/HNSW algorithms)
+    # novad-specific search params (no-op for novamr/HNSW algorithms)
     nprobe: int = 5
+    topk_amp: int = 10
+    # Nova build optimizer level. Default 3 enables THP loading, which requires
+    # /mnt/nova_thp and sudo privileges. Use 2 on local dev clusters that lack
+    # the tmpfs mount, keeping only graph optimization.
+    nova_build_optimize_level: int = 3
+
+    # Scan amplification knobs for the bitmap push-down path.
+    nova_topk_amp_mul: float = 1.0
+    nova_topk_amp_add: float = 0.0
+
+    # Plan selector: when not "auto", emits a verified GUC recipe forcing one of
+    # the 4 hybrid plan types (validated on tester/tester_10m across 5 rates).
+    force_plan: str = "auto"
+
+    # Hybrid-search / nova-bm25 benchmark extensions.
+    # hybrid_mode controls which schema and predicate shape the client uses:
+    #   none  - existing behavior (single embedding column, optional label).
+    #   array - single-table GIN array column for `@>` predicates.
+    #   join  - two-table model with chunk.pipeline_doc_id joining doc.tags.
+    hybrid_mode: str = "none"
+    array_field: str = "user_array"
+    doc_table_name: str = "doc_table"
+    doc_join_field: str = "pipeline_doc_id"
+    doc_tags_field: str = "tags"
 
     def parse_metric(self) -> str:
         if self.metric_type == MetricType.L2:
@@ -131,7 +155,60 @@ class AdbpgIndexConfig(BaseModel, DBCaseConfig):
             "fastann.hnsw_max_scan_points": self.max_scan_points,
             "fastann.index_scan_mode": self.index_scan_mode,
             "fastann.nova_nprobe": self.nprobe,
+            "fastann.topk_amp": self.topk_amp,
+            "fastann.nova_topk_amp_mul": self.nova_topk_amp_mul,
+            "fastann.nova_topk_amp_add": self.nova_topk_amp_add,
             "optimizer": "off",
             "elog_process_parameters": "off",
+            # Force custom plans for prepared statements; generic plans for
+            # hybrid join/array filters can drop the predicate after 5 execs.
+            "plan_cache_mode": "force_custom_plan",
         }
+        if self.force_plan != "auto":
+            session_parameters.update(self._plan_recipe(self.force_plan))
         return {"session_options": self._build_forced_set_options(session_parameters)}
+
+    @staticmethod
+    def _plan_recipe(plan: str) -> dict[str, Any]:
+        """GUC recipes verified on tester_10m (10M rows, GIN array, 5 rates).
+
+        Decision tree (src/backend/optimizer/path/fastannindexpath.c):
+          Stage 1: brute_force if tuples<bf_table or rows<bf_row or sel<bf_sel
+          Stage 2 within ANN:
+            S>=1 -> vector_only
+            S>expr_threshold -> post_filter
+            bitmap branch (gated by bitmap GUCs) -> bitmap_pushdown
+            else -> expression_separate
+        """
+        common_force_ann = {
+            "adbpg_fastann_hybrid_brute_force_with_row_threshold": 0,
+            "adbpg_fastann_hybrid_brute_force_with_table_threshold": 0,
+            "adbpg_fastann_hybrid_brute_force_selectivity_threshold": 0,
+        }
+        if plan == "brute_force":
+            return {
+                "adbpg_fastann_hybrid_brute_force_with_row_threshold": 100000000,
+                "adbpg_fastann_hybrid_brute_force_with_table_threshold": 100000000,
+            }
+        if plan == "post_filter":
+            return {
+                **common_force_ann,
+                "adbpg_fastann_hybrid_expression_pushdown_selectivity_threshold": 0,
+            }
+        if plan == "bitmap_pushdown":
+            return {
+                **common_force_ann,
+                "adbpg_fastann_hybrid_expression_pushdown_selectivity_threshold": 1.0,
+                "adbpg_enable_fastann_hybrid_bitmap_pushdown": "on",
+                "adbpg_fastann_bitmap_pushdown_selectivity_threshold": 1.0,
+                "adbpg_fastann_bitmap_pushdown_rows_threshold": -1,
+                "adbpg_fastann_bitmap_pushdown_bitmapcost_rate_threshold": 1.0,
+            }
+        if plan == "expression":
+            return {
+                **common_force_ann,
+                "adbpg_fastann_hybrid_expression_pushdown_selectivity_threshold": 1.0,
+                "adbpg_enable_fastann_hybrid_bitmap_pushdown": "off",
+            }
+        msg = f"unknown force_plan: {plan!r}"
+        raise ValueError(msg)

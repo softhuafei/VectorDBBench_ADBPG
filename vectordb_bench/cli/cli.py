@@ -131,16 +131,22 @@ def parse_task_stages(
     load: bool,
     search_serial: bool,
     search_concurrent: bool,
+    explain_only: bool = False,
 ) -> list[TaskStage]:
     stages = []
     if load and not drop_old:
         raise RuntimeError("Dropping old data cannot be skipped if loading data")
     if drop_old and not load:
         raise RuntimeError("Load cannot be skipped if dropping old data")
+    if explain_only and (search_serial or search_concurrent):
+        raise RuntimeError("--explain-only is incompatible with --search-serial / --search-concurrent")
     if drop_old:
         stages.append(TaskStage.DROP_OLD)
     if load:
         stages.append(TaskStage.LOAD)
+    if explain_only:
+        stages.append(TaskStage.EXPLAIN_ONLY)
+        return stages
     if search_serial:
         stages.append(TaskStage.SEARCH_SERIAL)
     if search_concurrent:
@@ -149,7 +155,11 @@ def parse_task_stages(
 
 
 def check_custom_case_parameters(ctx: any, param: any, value: any):  # noqa: ARG001
-    if ctx.params.get("case_type") == "PerformanceCustomDataset" and value is None:
+    if ctx.params.get("case_type") in (
+        "PerformanceCustomDataset",
+        "HybridArrayPerformanceCase",
+        "HybridJoinPerformanceCase",
+    ) and value is None:
         raise click.BadParameter(
             """ Custom case parameters
 --custom-case-name
@@ -171,6 +181,27 @@ def get_custom_case_config(parameters: dict) -> dict:
             "description": parameters["custom_case_description"],
             "load_timeout": parameters["custom_case_load_timeout"],
             "optimize_timeout": parameters["custom_case_optimize_timeout"],
+            "dataset_config": {
+                "name": parameters["custom_dataset_name"],
+                "dir": parameters["custom_dataset_dir"],
+                "size": parameters["custom_dataset_size"],
+                "dim": parameters["custom_dataset_dim"],
+                "metric_type": parameters["custom_dataset_metric_type"],
+                "file_count": parameters["custom_dataset_file_count"],
+                "use_shuffled": parameters["custom_dataset_use_shuffled"],
+                "with_gt": parameters["custom_dataset_with_gt"],
+            },
+        }
+    elif parameters["case_type"] in (
+        "HybridArrayPerformanceCase",
+        "HybridJoinPerformanceCase",
+    ):
+        custom_case_config = {
+            "name": parameters["custom_case_name"],
+            "description": parameters["custom_case_description"],
+            "load_timeout": parameters["custom_case_load_timeout"],
+            "optimize_timeout": parameters["custom_case_optimize_timeout"],
+            "hybrid_rate": parameters["hybrid_rate"],
             "dataset_config": {
                 "name": parameters["custom_dataset_name"],
                 "dir": parameters["custom_dataset_dir"],
@@ -257,6 +288,16 @@ class CommonTypedDict(TypedDict):
             type=bool,
             default=True,
             help="Search concurrent or skip",
+            show_default=True,
+        ),
+    ]
+    explain_only: Annotated[
+        bool,
+        click.option(
+            "--explain-only/--no-explain-only",
+            type=bool,
+            default=False,
+            help="Run prepare_filter only (emits EXPLAIN via the client's pre-test plan logger) and skip the real search loop. Implies --skip-search-serial and --skip-search-concurrent.",
             show_default=True,
         ),
     ]
@@ -464,6 +505,16 @@ class CommonTypedDict(TypedDict):
             show_default=True,
         ),
     ]
+    hybrid_rate: Annotated[
+        float,
+        click.option(
+            "--hybrid-rate",
+            help="Filter selectivity for HybridArrayPerformanceCase / HybridJoinPerformanceCase. "
+            "Must be one of 0.5, 0.1, 0.01, 0.001, 0.0001 (matches rate markers in the dataset).",
+            default=0.01,
+            show_default=True,
+        ),
+    ]
 
 
 class HNSWBaseTypedDict(TypedDict):
@@ -651,6 +702,7 @@ def run(
             parameters["load"],
             parameters["search_serial"],
             parameters["search_concurrent"],
+            parameters.get("explain_only", False),
         ),
         load_concurrency=parameters["load_concurrency"],
     )

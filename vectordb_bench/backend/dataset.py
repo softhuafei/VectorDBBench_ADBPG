@@ -124,12 +124,19 @@ class CustomDataset(BaseDataset):
     def train_files(self) -> list[str]:
         train_file = self.train_file
         prefix = f"{train_file}"
-        train_files = []
+        # Explicit comma-separated file list takes precedence.
         prefix_s = [item.strip() for item in prefix.split(",") if item.strip()]
-        for i in range(len(prefix_s)):
-            sub_file = f"{prefix_s[i]}.parquet"
-            train_files.append(sub_file)
-        return train_files
+        if len(prefix_s) > 1:
+            return [f"{p}.parquet" for p in prefix_s]
+
+        # Single prefix: if file_num > 1, generate shuffled shard names;
+        # otherwise fall back to a single train file (shuffle_train if use_shuffled).
+        if self.file_num > 1:
+            return utils.compose_train_files(self.file_num, self.use_shuffled)
+
+        if self.use_shuffled:
+            return [f"shuffle_{prefix_s[0]}.parquet"]
+        return [f"{prefix_s[0]}.parquet"]
 
 
 class LAION(BaseDataset):
