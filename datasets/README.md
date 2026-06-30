@@ -29,9 +29,51 @@ datasets/
 
 The `array` files target `HybridArrayPerformanceCase` (single-table `user_array @> '{tag}'::text[]`); the `join` files target `HybridJoinPerformanceCase` (vector ⋈ side-table `array_overlap`).
 
-## Train data is NOT included
+## Train shards: download from VectorDBBench's Aliyun OSS
 
-`shuffle_train*.parquet` (the actual 1M / 10M base vectors) is excluded — those total ~40 GB and are not tracked in git. Generate them via `scripts/construct_hybrid_dataset.py` or place pre-built train shards next to these GT files when running bench.
+The base vectors (`shuffle_train*.parquet`) are NOT tracked in git — together they are ~40 GB.
+They come from the same BioASQ corpus that upstream VectorDBBench publishes on the public
+Aliyun OSS bucket (anonymous read, no key required):
+
+```
+oss://assets.zilliz.com.cn/benchmark/bioasq_medium_1m/shuffle_train.parquet
+oss://assets.zilliz.com.cn/benchmark/bioasq_large_10m/shuffle_train-{00..09}-of-10.parquet
+```
+
+This is the same endpoint `AliyunOSSReader` already uses (see
+`vectordb_bench/__init__.py` → `ALIYUN_OSS_URL = "assets.zilliz.com.cn/benchmark/"`
+and `vectordb_bench/backend/data_source.py::AliyunOSSReader`).
+
+### Option A — let VectorDBBench fetch on first run (recommended)
+
+Switch the dataset source to AliyunOSS and point `DATASET_LOCAL_DIR` at this folder; the CLI
+(or the web UI's "Dataset from Aliyun (Shanghai)" checkbox) will download missing train
+shards into `bioasq_hybrid_medium_1m/` (or `bioasq_hybrid_large_10m/`) on first run.
+
+```bash
+export VECTORDB_BENCH_DATASET_SOURCE=AliyunOSS
+export DATASET_LOCAL_DIR=<repo>/datasets
+```
+
+### Option B — pre-download with ossutil
+
+```bash
+# 1M
+mkdir -p <repo>/datasets/bioasq_hybrid_medium_1m
+ossutil cp -r oss://assets.zilliz.com.cn/benchmark/bioasq_medium_1m/ \
+  <repo>/datasets/bioasq_hybrid_medium_1m/ --include "shuffle_train*.parquet"
+
+# 10M
+mkdir -p <repo>/datasets/bioasq_hybrid_large_10m
+ossutil cp -r oss://assets.zilliz.com.cn/benchmark/bioasq_large_10m/ \
+  <repo>/datasets/bioasq_hybrid_large_10m/ --include "shuffle_train*.parquet"
+```
+
+> Note: upstream stores the train shards under `bioasq_medium_1m/` / `bioasq_large_10m/`
+> (no `_hybrid_` suffix). The `_hybrid_` directories in this repo are the bench's custom
+> case dirs — download the shards into them, or symlink an existing upstream copy in. The
+> `neighbors_*` / `test.parquet` files that ship with this repo do NOT need to be
+> re-downloaded.
 
 ## Usage with VectorDBBench
 
