@@ -1,6 +1,11 @@
 # Hybrid Search Ground-Truth Datasets
 
-Pre-computed hybrid GT for BioASQ 1024-d cosine, two sizes × array/join filter mode × five selectivity points.
+BioASQ 1024-d cosine datasets for two complementary benchmark families:
+
+- `HybridUnifiedPerformanceCase`: scalar, array, and JSON predicates derived
+  from the same percentile truth set and sharing one GT file per selectivity.
+- `HybridJoinPerformanceCase`: a separate realistic 1:N chunk-to-document
+  model whose clustered hits require its own GT.
 
 ## Layout
 
@@ -9,15 +14,20 @@ datasets/
 ├── bioasq_hybrid_medium_1m/   # base = 1,000,000 vectors
 │   ├── test.parquet                          # 1000 query vectors
 │   ├── neighbors.parquet                     # pure ANN top-100 GT
-│   ├── neighbors_array_{50p,10p,1p,0.10p,0.01p}.parquet
+│   ├── neighbors_hybrid_<rate>.parquet        # generated unified GT
 │   └── neighbors_join_{50p,10p,1p,0.10p,0.01p}.parquet
 └── bioasq_hybrid_large_10m/   # base = 10,000,000 vectors
     ├── test.parquet
-    ├── neighbors_array_{50p,10p,1p,0.10p,0.01p}.parquet
+    ├── neighbors_hybrid_<rate>.parquet        # generated unified GT
     └── neighbors_join_{50p,10p,1p,0.10p,0.01p}.parquet
 ```
 
-`*p` in the filename is the post-filter selectivity (the fraction of rows that pass the scalar predicate before the top-k cut):
+`<rate>` is the post-filter selectivity. The unified default grid is
+0.1%, 1%, 5%, 10%, 20%, 22%, 25%, 30%, 40%, 50%, 55%, 60%, 70%, 80%,
+and 90%. Scalar, array, and JSON predicates at a given rate all reference
+the same `neighbors_hybrid_<rate>.parquet`.
+
+The retained Join fixtures use the legacy reciprocal grid:
 
 | Suffix | Selectivity | `--hybrid-rate` |
 |---|---|---|
@@ -27,7 +37,9 @@ datasets/
 | `0.10p` | 0.1%  | 0.001  |
 | `0.01p` | 0.01% | 0.0001 |
 
-The `array` files target `HybridArrayPerformanceCase` (single-table `user_array @> '{tag}'::text[]`); the `join` files target `HybridJoinPerformanceCase` (vector ⋈ side-table `array_overlap`).
+The Join files target `HybridJoinPerformanceCase` (vector ⋈ side-table
+`array_overlap`). The retired standalone `HybridArrayPerformanceCase` is
+available on the original `hybrid_bench` branch for historical reports.
 
 ## Train shards: download from VectorDBBench's Aliyun OSS
 
@@ -84,8 +96,20 @@ vectordbbench adbpgnova ... \
   --custom-dataset-name bioasq_hybrid_medium_1m \
   --custom-dataset-dir . \
   --custom-dataset-with-gt \
-  --case-type HybridArrayPerformanceCase \
-  --hybrid-rate 0.1
+  --case-type HybridUnifiedPerformanceCase \
+  --hybrid-mode unified \
+  --hybrid-filter-type array \
+  --hybrid-rate 0.2
 ```
 
-The runner picks the right `neighbors_<mode>_<rate>p.parquet` based on `--hybrid-mode {array,join}` and `--hybrid-rate`.
+Generate unified GT before a full run:
+
+```bash
+python scripts/construct_hybrid_dataset.py \
+  --src /data/bioasq/bioasq_medium_1m \
+  --dst datasets/bioasq_hybrid_medium_1m \
+  --train-file shuffle_train.parquet \
+  --modes unified
+```
+
+Use `--modes join` only for the independent multi-table benchmark.

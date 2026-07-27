@@ -12,6 +12,7 @@ import numpy as np
 import psycopg
 from pgvector.psycopg import register_vector
 from psycopg import Connection, Cursor, sql
+from psycopg.types.json import Jsonb
 
 from vectordb_bench.backend.filter import Filter, FilterOp
 
@@ -36,6 +37,8 @@ class Adbpg(VectorDB):
         FilterOp.StrEqual,
         FilterOp.ArrayContains,
         FilterOp.JoinArrayOverlap,
+        FilterOp.PercentileLT,
+        FilterOp.JsonContains,
     ]
 
     conn: psycopg.Connection[Any] | None = None
@@ -73,7 +76,10 @@ class Adbpg(VectorDB):
         # Hybrid-search state: schema flavor.
         self.hybrid_mode = getattr(self.case_config, "hybrid_mode", "none")
 
-        if self.hybrid_mode == "join":
+        # Hybrid JOIN and unified benchmarks must use the dispatcher so rows
+        # are physically distributed across primary segments. Utility mode
+        # would COPY all rows into the coordinator's local heap.
+        if self.hybrid_mode in {"join", "unified"}:
             self.connect_config.pop("options", None)
 
         # construct basic units
@@ -329,19 +335,23 @@ class Adbpg(VectorDB):
             log.info(f"{self.name} client create table : {self.table_name} (hybrid_mode={self.hybrid_mode})")
 
             extra_columns: list[str] = []
-            if self.hybrid_mode == "array":
-                # Single-table model: GIN array column + scalar pipeline_id (btree).
-                extra_columns.append(f", {self.case_config.array_field} TEXT[]")
-                extra_columns.append(", pipeline_id TEXT")
-            elif self.hybrid_mode == "join":
+            if self.hybrid_mode == "join":
                 # Two-table model: chunk table carries the pipeline_doc_id FK.
                 extra_columns.append(f", {self.case_config.doc_join_field} BIGINT")
+            elif self.hybrid_mode == "unified":
+                extra_columns.extend(
+                    [
+                        ", percentile INTEGER NOT NULL",
+                        ", user_array TEXT[] NOT NULL",
+                        ", payload JSONB NOT NULL",
+                    ],
+                )
 
             label_column = ""
             if self.with_scalar_labels:
                 label_column = f", {self._scalar_label_field} VARCHAR(64)"
 
-            dist_clause = " DISTRIBUTED BY (id)" if self.hybrid_mode == "join" else ""
+            dist_clause = " DISTRIBUTED BY (id)" if self.hybrid_mode in {"join", "unified"} else ""
 
             create_sql = sql.SQL(
                 f"""
@@ -401,25 +411,7 @@ class Adbpg(VectorDB):
             return
         assert self.conn is not None
         assert self.cursor is not None
-        if self.hybrid_mode == "array":
-            self.cursor.execute(
-                sql.SQL(
-                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} USING gin ({col})",
-                ).format(
-                    idx=sql.Identifier(f"{self.table_name}_{self.case_config.array_field}_gin"),
-                    tbl=sql.Identifier(self.table_name),
-                    col=sql.Identifier(self.case_config.array_field),
-                ),
-            )
-            self.cursor.execute(
-                sql.SQL(
-                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} (pipeline_id)",
-                ).format(
-                    idx=sql.Identifier(f"{self.table_name}_pipeline_id_btree"),
-                    tbl=sql.Identifier(self.table_name),
-                ),
-            )
-        elif self.hybrid_mode == "join":
+        if self.hybrid_mode == "join":
             doc = self.case_config.doc_table_name
             self.cursor.execute(
                 sql.SQL(
@@ -437,6 +429,29 @@ class Adbpg(VectorDB):
                     idx=sql.Identifier(f"{self.table_name}_{self.case_config.doc_join_field}_btree"),
                     tbl=sql.Identifier(self.table_name),
                     col=sql.Identifier(self.case_config.doc_join_field),
+                ),
+            )
+        elif self.hybrid_mode == "unified":
+            self.cursor.execute(
+                sql.SQL("CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} (percentile)").format(
+                    idx=sql.Identifier(f"{self.table_name}_percentile_btree"),
+                    tbl=sql.Identifier(self.table_name),
+                ),
+            )
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} USING gin (user_array)",
+                ).format(
+                    idx=sql.Identifier(f"{self.table_name}_user_array_gin"),
+                    tbl=sql.Identifier(self.table_name),
+                ),
+            )
+            self.cursor.execute(
+                sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {idx} ON public.{tbl} USING gin (payload jsonb_path_ops)",
+                ).format(
+                    idx=sql.Identifier(f"{self.table_name}_payload_gin"),
+                    tbl=sql.Identifier(self.table_name),
                 ),
             )
         self.conn.commit()
@@ -460,11 +475,10 @@ class Adbpg(VectorDB):
             base_types: list[Any] = ["bigint", "vector"]
             if self.with_scalar_labels:
                 base_types.append("varchar")
-            if self.hybrid_mode == "array":
-                # 1009 = text[] (psycopg registry has no '_text' alias).
-                base_types.extend([1009, "text"])
-            elif self.hybrid_mode == "join":
+            if self.hybrid_mode == "join":
                 base_types.append("bigint")
+            elif self.hybrid_mode == "unified":
+                base_types.extend(["integer", 1009, "jsonb"])
 
             with self.cursor.copy(
                 sql.SQL("COPY public.{table_name} FROM STDIN (FORMAT BINARY)").format(
@@ -477,11 +491,16 @@ class Adbpg(VectorDB):
                     values: list[Any] = [rid, embeddings_arr[i]]
                     if self.with_scalar_labels:
                         values.append(labels_data[i])
-                    if self.hybrid_mode == "array":
-                        values.append(hybrid_synth.user_array_for(rid))
-                        values.append(hybrid_synth.pipeline_id_for(rid))
-                    elif self.hybrid_mode == "join":
+                    if self.hybrid_mode == "join":
                         values.append(hybrid_synth.pipeline_doc_id_for(rid))
+                    elif self.hybrid_mode == "unified":
+                        values.extend(
+                            [
+                                hybrid_synth.filter_percentile_for(rid),
+                                hybrid_synth.unified_user_array_for(rid),
+                                Jsonb(hybrid_synth.unified_payload_for(rid)),
+                            ],
+                        )
                     copy.write_row(tuple(values))
             self.conn.commit()
 
@@ -506,6 +525,11 @@ class Adbpg(VectorDB):
                 f"WHERE {filters.join_field} IN (SELECT {filters.join_field} FROM public.{filters.doc_table} "
                 f"WHERE {filters.tags_field} && ARRAY[{vals}]::text[])"
             )
+        elif filters.type == FilterOp.PercentileLT:
+            self.where_clause = f"WHERE {filters.percentile_field} < {filters.threshold}"
+        elif filters.type == FilterOp.JsonContains:
+            payload = json.dumps({"rates": [filters.marker]}, separators=(",", ":"))
+            self.where_clause = f"WHERE {filters.json_field} @> '{payload}'::jsonb"
         else:
             msg = f"Not support Filter for Adbpg - {filters}"
             raise ValueError(msg)

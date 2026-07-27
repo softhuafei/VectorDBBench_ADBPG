@@ -25,6 +25,10 @@ class Metric:
     serial_latency_avg: float = 0.0
     recall: float = 0.0
     ndcg: float = 0.0
+    serial_query_count: int = 0
+    min_result_count: int = 0
+    insufficient_query_count: int = 0
+    insufficient_query_rate: float = 0.0
     conc_num_list: list[int] = field(default_factory=list)
     conc_qps_list: list[float] = field(default_factory=list)
     conc_latency_p99_list: list[float] = field(default_factory=list)

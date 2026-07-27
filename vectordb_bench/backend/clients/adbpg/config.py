@@ -83,10 +83,9 @@ class AdbpgIndexConfig(BaseModel, DBCaseConfig):
     # Hybrid-search / nova-bm25 benchmark extensions.
     # hybrid_mode controls which schema and predicate shape the client uses:
     #   none  - existing behavior (single embedding column, optional label).
-    #   array - single-table GIN array column for `@>` predicates.
     #   join  - two-table model with chunk.pipeline_doc_id joining doc.tags.
+    #   unified - percentile/array/json columns derived from the same truth set.
     hybrid_mode: str = "none"
-    array_field: str = "user_array"
     doc_table_name: str = "doc_table"
     doc_join_field: str = "pipeline_doc_id"
     doc_tags_field: str = "tags"

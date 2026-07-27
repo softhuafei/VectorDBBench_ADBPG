@@ -33,6 +33,10 @@ class FormatResult(BaseModel):
     serial_latency_p99: float = 0
     recall: float = 0
     ndcg: float = 0
+    serial_query_count: int = 0
+    min_result_count: int = 0
+    insufficient_query_count: int = 0
+    insufficient_query_rate: float = 0
     conc_num_list: list[int] = []
     conc_qps_list: list[float] = []
     conc_latency_p99_list: list[float] = []

@@ -11,6 +11,8 @@ class FilterOp(StrEnum):
     NonFilter = "NonFilter"
     ArrayContains = "ArrayContains"  # GIN @> on a single-table array column
     JoinArrayOverlap = "JoinArrayOverlap"  # subquery IN (SELECT ... WHERE tags && ARRAY[...])
+    PercentileLT = "PercentileLT"
+    JsonContains = "JsonContains"
 
 
 class Filter(BaseModel):
@@ -108,15 +110,8 @@ class ArrayContainsFilter(Filter):
     values: list[str] = Field(default_factory=list)
 
     @property
-    def rate_label(self) -> str:
-        r = self.filter_rate * 100
-        if r >= 1:
-            return f"{int(r)}p"
-        return f"{r:.2f}p"
-
-    @property
     def groundtruth_file(self) -> str:
-        return f"neighbors_array_{self.rate_label}.parquet"
+        return f"neighbors_hybrid_{hybrid_rate_label(self.filter_rate)}.parquet"
 
 
 class JoinArrayOverlapFilter(Filter):
@@ -138,3 +133,30 @@ class JoinArrayOverlapFilter(Filter):
     @property
     def groundtruth_file(self) -> str:
         return f"neighbors_join_{self.rate_label}.parquet"
+
+
+def hybrid_rate_label(rate: float) -> str:
+    percent = rate * 100
+    if abs(percent - round(percent)) < 1e-9:
+        return f"{int(round(percent))}p"
+    return f"{percent:.2f}".rstrip("0").rstrip(".").replace(".", "_") + "p"
+
+
+class UnifiedHybridFilter(Filter):
+    """Base for predicates sharing one percentile-derived truth set."""
+
+    @property
+    def groundtruth_file(self) -> str:
+        return f"neighbors_hybrid_{hybrid_rate_label(self.filter_rate)}.parquet"
+
+
+class PercentileLTFilter(UnifiedHybridFilter):
+    type: FilterOp = FilterOp.PercentileLT
+    percentile_field: str = "percentile"
+    threshold: int
+
+
+class JsonContainsFilter(UnifiedHybridFilter):
+    type: FilterOp = FilterOp.JsonContains
+    json_field: str = "payload"
+    marker: str

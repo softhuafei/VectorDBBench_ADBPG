@@ -1,8 +1,8 @@
 """Deterministic synthesis of hybrid-search columns from a row id.
 
 Used by both the loader (insert_embeddings) and the offline ground-truth
-construction script so that every row's user_array / pipeline_id /
-pipeline_doc_id / tags are reproducible from the id alone.
+construction script so that every row's unified filter columns and the
+JOIN-side pipeline_doc_id / tags are reproducible from the id alone.
 
 Rate markers
 ============
@@ -23,13 +23,32 @@ import hashlib
 # pipeline cardinality ~100). Rate markers are layered on top.
 ARRAY_CARDINALITY = 100_000
 ARRAY_FILLER_LEN = 45
-PIPELINE_BUCKETS = 1_000
 CHUNKS_PER_DOC = 10
 DOC_TAGS_CARDINALITY = 10_000
 DOC_TAGS_FILLER_LEN = 15
 
 # Each marker hits exactly 1/denom of the corpus.
 RATE_DENOMS = (2, 10, 100, 1_000, 10_000)
+
+# RBO boundary experiments focus on medium/high selectivities. Markers are
+# nested: a row at percentile 1,500 belongs to every threshold above 1,500.
+UNIFIED_RATE_THRESHOLDS = (
+    10,
+    100,
+    500,
+    1_000,
+    2_000,
+    2_200,
+    2_500,
+    3_000,
+    4_000,
+    5_000,
+    5_500,
+    6_000,
+    7_000,
+    8_000,
+    9_000,
+)
 
 
 def _h(*parts: object) -> int:
@@ -56,27 +75,58 @@ def rate_marker_for_rate(rate: float) -> str:
     raise ValueError(msg)
 
 
-def user_array_for(
+def filter_percentile_for(row_id: int) -> int:
+    """Stable percentile bucket in [0, 10000), independent of Python hash."""
+    return _h("filter-v1", row_id) % 10_000
+
+
+def unified_threshold_for_rate(rate: float) -> int:
+    threshold = int(round(rate * 10_000))
+    if not 0 < threshold <= 10_000 or abs(rate - threshold / 10_000) > 1e-9:
+        raise ValueError(f"rate must be representable in basis points and in (0, 1], got {rate}")
+    return threshold
+
+
+def unified_rate_marker_for_rate(rate: float) -> str:
+    threshold = unified_threshold_for_rate(rate)
+    if threshold not in UNIFIED_RATE_THRESHOLDS:
+        supported = [threshold / 10_000 for threshold in UNIFIED_RATE_THRESHOLDS]
+        raise ValueError(f"unsupported unified rate {rate}; supported: {supported}")
+    return f"r_{threshold}bp"
+
+
+def unified_rate_markers_for_id(row_id: int) -> list[str]:
+    percentile = filter_percentile_for(row_id)
+    return [f"r_{threshold}bp" for threshold in UNIFIED_RATE_THRESHOLDS if percentile < threshold]
+
+
+def unified_user_array_for(
     row_id: int,
     cardinality: int = ARRAY_CARDINALITY,
     filler_len: int = ARRAY_FILLER_LEN,
 ) -> list[str]:
-    """Return the deterministic TEXT[] for a chunk row: rate markers
-    followed by Zipf-like filler tokens."""
-    out = list(rate_markers_for_id(row_id))
+    markers = unified_rate_markers_for_id(row_id)
+    out = list(markers)
     seen: set[int] = set()
-    i = 0
-    while len(out) - len(rate_markers_for_id(row_id)) < filler_len:
-        v = _h("ua", row_id, i) % cardinality
-        if v not in seen:
-            seen.add(v)
-            out.append(f"a{v}")
-        i += 1
+    # One cryptographic seed per row is enough for deterministic benchmark
+    # filler. SplitMix64 then produces a fast, uniform sequence, avoiding 45
+    # Blake2 calls per row on 10M-scale loads.
+    state = _h("unified-ua-v2", row_id)
+    mask64 = (1 << 64) - 1
+    while len(out) - len(markers) < filler_len:
+        state = (state + 0x9E3779B97F4A7C15) & mask64
+        mixed = state
+        mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & mask64
+        mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & mask64
+        value = (mixed ^ (mixed >> 31)) % cardinality
+        if value not in seen:
+            seen.add(value)
+            out.append(f"a{value}")
     return out
 
 
-def pipeline_id_for(row_id: int, buckets: int = PIPELINE_BUCKETS) -> str:
-    return f"p{_h('pid', row_id) % buckets}"
+def unified_payload_for(row_id: int) -> dict[str, list[str]]:
+    return {"rates": unified_rate_markers_for_id(row_id)}
 
 
 def pipeline_doc_id_for(row_id: int, chunks_per_doc: int = CHUNKS_PER_DOC) -> int:

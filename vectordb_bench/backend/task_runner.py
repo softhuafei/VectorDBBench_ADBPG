@@ -227,7 +227,17 @@ class CaseRunner(BaseModel):
                     ) = search_results
                 if TaskStage.SEARCH_SERIAL in self.config.stages:
                     search_results = self._serial_search()
-                    m.recall, m.ndcg, m.serial_latency_avg, m.serial_latency_p99, m.serial_latency_p95 = search_results
+                    (
+                        m.recall,
+                        m.ndcg,
+                        m.serial_latency_avg,
+                        m.serial_latency_p99,
+                        m.serial_latency_p95,
+                        m.min_result_count,
+                        m.insufficient_query_count,
+                        m.insufficient_query_rate,
+                        m.serial_query_count,
+                    ) = search_results
 
         except Exception as e:
             log.warning(f"Failed to run performance case, reason = {e}")
@@ -334,6 +344,7 @@ class CaseRunner(BaseModel):
                 ground_truth=gt_df,
                 filters=self.ca.filters,
                 k=self.config.case_config.k,
+                query_count=self.config.case_config.serial_query_count,
             )
         if TaskStage.SEARCH_CONCURRENT in self.config.stages:
             self.search_runner = MultiProcessingSearchRunner(

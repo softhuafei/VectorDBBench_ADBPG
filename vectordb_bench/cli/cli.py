@@ -157,8 +157,8 @@ def parse_task_stages(
 def check_custom_case_parameters(ctx: any, param: any, value: any):  # noqa: ARG001
     if ctx.params.get("case_type") in (
         "PerformanceCustomDataset",
-        "HybridArrayPerformanceCase",
         "HybridJoinPerformanceCase",
+        "HybridUnifiedPerformanceCase",
     ) and value is None:
         raise click.BadParameter(
             """ Custom case parameters
@@ -193,8 +193,8 @@ def get_custom_case_config(parameters: dict) -> dict:
             },
         }
     elif parameters["case_type"] in (
-        "HybridArrayPerformanceCase",
         "HybridJoinPerformanceCase",
+        "HybridUnifiedPerformanceCase",
     ):
         custom_case_config = {
             "name": parameters["custom_case_name"],
@@ -213,6 +213,8 @@ def get_custom_case_config(parameters: dict) -> dict:
                 "with_gt": parameters["custom_dataset_with_gt"],
             },
         }
+        if parameters["case_type"] == "HybridUnifiedPerformanceCase":
+            custom_case_config["hybrid_filter_type"] = parameters["hybrid_filter_type"]
     elif parameters["case_type"] == "NewIntFilterPerformanceCase":
         custom_case_config = {
             "dataset_with_size_type": parameters["dataset_with_size_type"],
@@ -339,6 +341,16 @@ class CommonTypedDict(TypedDict):
             default=config.K_DEFAULT,
             show_default=True,
             help="K value for number of nearest neighbors to search",
+        ),
+    ]
+    serial_query_count: Annotated[
+        int,
+        click.option(
+            "--serial-query-count",
+            type=click.IntRange(min=1),
+            default=500,
+            show_default=True,
+            help="Maximum number of distinct queries used by serial correctness and latency search",
         ),
     ]
     concurrency_duration: Annotated[
@@ -509,9 +521,18 @@ class CommonTypedDict(TypedDict):
         float,
         click.option(
             "--hybrid-rate",
-            help="Filter selectivity for HybridArrayPerformanceCase / HybridJoinPerformanceCase. "
-            "Must be one of 0.5, 0.1, 0.01, 0.001, 0.0001 (matches rate markers in the dataset).",
+            help="Filter selectivity for hybrid cases. Unified mode supports its configured threshold grid.",
             default=0.01,
+            show_default=True,
+        ),
+    ]
+    hybrid_filter_type: Annotated[
+        str,
+        click.option(
+            "--hybrid-filter-type",
+            type=click.Choice(["scalar", "array", "json"]),
+            help="Predicate representation for HybridUnifiedPerformanceCase",
+            default="scalar",
             show_default=True,
         ),
     ]
@@ -690,6 +711,7 @@ def run(
         case_config=CaseConfig(
             case_id=CaseType[parameters["case_type"]],
             k=parameters["k"],
+            serial_query_count=parameters["serial_query_count"],
             concurrency_search_config=ConcurrencySearchConfig(
                 concurrency_duration=parameters["concurrency_duration"],
                 num_concurrency=[int(s) for s in parameters["num_concurrency"]],

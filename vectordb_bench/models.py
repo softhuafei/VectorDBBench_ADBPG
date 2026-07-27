@@ -199,6 +199,7 @@ class CaseConfig(BaseModel):
     case_id: CaseType
     custom_case: dict | None = None
     k: int | None = config.K_DEFAULT
+    serial_query_count: int = 500
     concurrency_search_config: ConcurrencySearchConfig = ConcurrencySearchConfig()
 
     '''

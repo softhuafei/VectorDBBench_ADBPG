@@ -194,7 +194,7 @@ class AdbpgTypedDict(CommonTypedDict):
         str,
         click.option(
             "--hybrid-mode",
-            type=click.Choice(["none", "array", "join"]),
+            type=click.Choice(["none", "join", "unified"]),
             help="Hybrid-search schema flavor",
             default="none",
             show_default=True,

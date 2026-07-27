@@ -1,4 +1,5 @@
 import concurrent.futures
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -130,6 +131,7 @@ class SerialSearchRunner:
         ground_truth: list[list[int]],
         k: int = 100,
         filters: Filter = non_filter,
+        query_count: int = 500,
     ):
         self.db = db
         self.k = k
@@ -141,7 +143,7 @@ class SerialSearchRunner:
             self.test_data = test_data
         self.ground_truth = ground_truth
 
-        max_queries = 500
+        max_queries = query_count
         if len(self.test_data) > max_queries:
             log.info(f"Truncating test_data from {len(self.test_data)} to {max_queries} queries")
             self.test_data = self.test_data[:max_queries]
@@ -161,7 +163,7 @@ class SerialSearchRunner:
 
         return results
 
-    def search(self, args: tuple[list, list[list[int]]]) -> tuple[float, float, float, float, float]:
+    def search(self, args: tuple[list, list[list[int]]]) -> tuple[float, float, float, float, float, int, int, float, int]:
         log.info(f"{mp.current_process().name:14} start search the entire test_data to get recall and latency")
         with self.db.init():
             self.db.prepare_filter(self.filters)
@@ -171,7 +173,7 @@ class SerialSearchRunner:
             log.debug(f"test dataset size: {len(test_data)}")
             log.debug(f"ground truth size: {len(ground_truth)}")
 
-            latencies, recalls, ndcgs = [], [], []
+            latencies, recalls, ndcgs, result_counts = [], [], [], []
             for idx, emb in enumerate(test_data):
                 s = time.perf_counter()
                 try:
@@ -181,6 +183,7 @@ class SerialSearchRunner:
                     raise e from None
 
                 latencies.append(time.perf_counter() - s)
+                result_counts.append(len(results))
 
                 if ground_truth is not None:
                     gt = ground_truth[idx]
@@ -189,6 +192,22 @@ class SerialSearchRunner:
                 else:
                     recalls.append(0)
                     ndcgs.append(0)
+
+                log.info(
+                    "SERIAL_QUERY_RESULT %s",
+                    json.dumps(
+                        {
+                            "query_index": idx,
+                            "topk": self.k,
+                            "returned_count": result_counts[-1],
+                            "is_insufficient": result_counts[-1] < self.k,
+                            "recall_at_k": recalls[-1],
+                            "ndcg_at_k": ndcgs[-1],
+                            "latency_ms": latencies[-1] * 1000,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
 
                 if len(latencies) % 100 == 0:
                     log.debug(
@@ -202,6 +221,9 @@ class SerialSearchRunner:
         cost = round(np.sum(latencies), 4)
         p99 = round(np.percentile(latencies, 99), 4)
         p95 = round(np.percentile(latencies, 95), 4)
+        min_result_count = min(result_counts)
+        insufficient_query_count = sum(count < self.k for count in result_counts)
+        insufficient_query_rate = round(insufficient_query_count / len(result_counts), 6)
         log.info(
             f"{mp.current_process().name:14} search entire test_data: "
             f"cost={cost}s, "
@@ -210,17 +232,30 @@ class SerialSearchRunner:
             f"avg_ndcg={avg_ndcg}, "
             f"avg_latency={avg_latency}, "
             f"p99={p99}, "
-            f"p95={p95}"
+            f"p95={p95}, "
+            f"min_result_count={min_result_count}, "
+            f"insufficient_query_count={insufficient_query_count}, "
+            f"insufficient_query_rate={insufficient_query_rate}"
         )
-        return (avg_recall, avg_ndcg, avg_latency, p99, p95)
+        return (
+            avg_recall,
+            avg_ndcg,
+            avg_latency,
+            p99,
+            p95,
+            min_result_count,
+            insufficient_query_count,
+            insufficient_query_rate,
+            len(result_counts),
+        )
 
-    def _run_in_subprocess(self) -> tuple[float, float, float, float, float]:
+    def _run_in_subprocess(self) -> tuple[float, float, float, float, float, int, int, float, int]:
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.search, (self.test_data, self.ground_truth))
             return future.result()
 
     @utils.time_it
-    def run(self) -> tuple[float, float, float, float]:
+    def run(self) -> tuple[float, float, float, float, float, int, int, float, int]:
         log.info(f"{mp.current_process().name:14} start serial search")
         if self.test_data is None:
             msg = "empty test_data"
@@ -229,11 +264,11 @@ class SerialSearchRunner:
         return self._run_in_subprocess()
 
     @utils.time_it
-    def run_with_cost(self) -> tuple[tuple[float, float, float, float], float]:
+    def run_with_cost(self) -> tuple[tuple[float, float, float, float, float, int, int, float, int], float]:
         """
         Search all test data in serial.
         Returns:
-            tuple[tuple[float, float, float, float], float]: (avg_recall, avg_ndcg, p99_latency, p95_latency), cost
+            Search metrics plus the timing wrapper's total cost.
         """
         log.info(f"{mp.current_process().name:14} start serial search")
         if self.test_data is None:

@@ -10,9 +10,11 @@ from vectordb_bench.backend.filter import (
     FilterOp,
     IntFilter,
     JoinArrayOverlapFilter,
+    JsonContainsFilter,
     LabelFilter,
     NewIntFilter,
     NonFilter,
+    PercentileLTFilter,
     non_filter,
 )
 from vectordb_bench.base import BaseModel
@@ -67,8 +69,8 @@ class CaseType(Enum):
 
     NewIntFilterPerformanceCase = 400
 
-    HybridArrayPerformanceCase = 500
     HybridJoinPerformanceCase = 501
+    HybridUnifiedPerformanceCase = 502
 
     def case_cls(self, custom_configs: dict | None = None) -> type["Case"]:
         if custom_configs is None:
@@ -644,41 +646,6 @@ class LabelFilterPerformanceCase(PerformanceCase):
         return LabelFilter(label_percentage=self.label_percentage)
 
 
-def _rate_marker_token(rate: float) -> str:
-    for d in (2, 10, 100, 1_000, 10_000):
-        if abs(rate - 1.0 / d) < 1e-9:
-            return f"r_{d}"
-    msg = f"unsupported hybrid_rate {rate}; expected one of 0.5/0.1/0.01/0.001/0.0001"
-    raise ValueError(msg)
-
-
-class HybridArrayPerformanceCase(PerformanceCustomDataset):
-    case_id: CaseType = CaseType.HybridArrayPerformanceCase
-    name: str = "Hybrid Array Filter (Custom Dataset)"
-    hybrid_rate: float = 0.01
-    array_field: str = "user_array"
-
-    def __init__(
-        self,
-        hybrid_rate: float,
-        array_field: str = "user_array",
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        # Pydantic v2 requires using object.__setattr__ to set fields after init
-        # if they aren't already declared in kwargs handled by the parent.
-        self.hybrid_rate = hybrid_rate
-        self.array_field = array_field
-
-    @property
-    def filters(self) -> Filter:
-        return ArrayContainsFilter(
-            filter_rate=self.hybrid_rate,
-            array_field=self.array_field,
-            values=[_rate_marker_token(self.hybrid_rate)],
-        )
-
-
 class HybridJoinPerformanceCase(PerformanceCustomDataset):
     case_id: CaseType = CaseType.HybridJoinPerformanceCase
     name: str = "Hybrid 2-Table Join Filter (Custom Dataset)"
@@ -703,13 +670,49 @@ class HybridJoinPerformanceCase(PerformanceCustomDataset):
 
     @property
     def filters(self) -> Filter:
+        from vectordb_bench.backend.clients.adbpg import hybrid_synth
+
         return JoinArrayOverlapFilter(
             filter_rate=self.hybrid_rate,
             join_field=self.join_field,
             tags_field=self.tags_field,
             doc_table=self.doc_table,
-            values=[_rate_marker_token(self.hybrid_rate)],
+            values=[hybrid_synth.rate_marker_for_rate(self.hybrid_rate)],
         )
+
+
+class HybridUnifiedPerformanceCase(PerformanceCustomDataset):
+    case_id: CaseType = CaseType.HybridUnifiedPerformanceCase
+    name: str = "Hybrid Unified Filter (Custom Dataset)"
+    hybrid_rate: float = 0.2
+    hybrid_filter_type: str = "scalar"
+
+    def __init__(self, hybrid_rate: float, hybrid_filter_type: str = "scalar", **kwargs):
+        super().__init__(**kwargs)
+        if hybrid_filter_type not in {"scalar", "array", "json"}:
+            raise ValueError("hybrid_filter_type must be scalar, array, or json")
+        self.hybrid_rate = hybrid_rate
+        self.hybrid_filter_type = hybrid_filter_type
+
+    @property
+    def filters(self) -> Filter:
+        # Import here to keep the generic case layer independent of DB clients
+        # during module initialization.
+        from vectordb_bench.backend.clients.adbpg import hybrid_synth
+
+        marker = hybrid_synth.unified_rate_marker_for_rate(self.hybrid_rate)
+        if self.hybrid_filter_type == "scalar":
+            return PercentileLTFilter(
+                filter_rate=self.hybrid_rate,
+                threshold=hybrid_synth.unified_threshold_for_rate(self.hybrid_rate),
+            )
+        if self.hybrid_filter_type == "array":
+            return ArrayContainsFilter(
+                filter_rate=self.hybrid_rate,
+                array_field="user_array",
+                values=[marker],
+            )
+        return JsonContainsFilter(filter_rate=self.hybrid_rate, marker=marker)
 
 
 type2case = {
@@ -736,6 +739,6 @@ type2case = {
     CaseType.StreamingCustomDataset: StreamingCustomDataset,
     CaseType.NewIntFilterPerformanceCase: NewIntFilterPerformanceCase,
     CaseType.LabelFilterPerformanceCase: LabelFilterPerformanceCase,
-    CaseType.HybridArrayPerformanceCase: HybridArrayPerformanceCase,
     CaseType.HybridJoinPerformanceCase: HybridJoinPerformanceCase,
+    CaseType.HybridUnifiedPerformanceCase: HybridUnifiedPerformanceCase,
 }

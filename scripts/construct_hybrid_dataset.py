@@ -5,7 +5,7 @@ id+emb) and writes:
   - shuffle_train.parquet  (re-keyed copy / subset of input)
   - test.parquet           (copy / subset of input)
   - neighbors.parquet      (full GT)
-  - neighbors_array_<rate>.parquet  for each rate in RATE_DENOMS
+  - neighbors_hybrid_<rate>.parquet shared by scalar/array/json filters
   - neighbors_join_<rate>.parquet   for each rate in RATE_DENOMS
 
 Supports either a single `--train-file` or a glob/list `--train-glob` for
@@ -38,7 +38,13 @@ from __future__ import annotations
 import argparse
 import glob as _glob
 import logging
+import sys
 from pathlib import Path
+
+# Prefer this checkout over an older globally installed vectordb_bench.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pyarrow as pa
@@ -50,15 +56,24 @@ log = logging.getLogger("construct_hybrid")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
-def build_array_mask(num_train: int, denom: int) -> np.ndarray:
-    ids = np.arange(num_train, dtype=np.int64)
-    return (ids % denom) == 0
-
-
-def build_join_mask(num_train: int, denom: int, chunks_per_doc: int) -> np.ndarray:
-    ids = np.arange(num_train, dtype=np.int64)
-    doc_ids = ids // chunks_per_doc
+def build_join_mask(row_ids: np.ndarray, denom: int, chunks_per_doc: int) -> np.ndarray:
+    doc_ids = row_ids // chunks_per_doc
     return (doc_ids % denom) == 0
+
+
+def build_unified_percentiles(row_ids: np.ndarray) -> np.ndarray:
+    return np.fromiter(
+        (hybrid_synth.filter_percentile_for(int(row_id)) for row_id in row_ids),
+        dtype=np.int32,
+        count=len(row_ids),
+    )
+
+
+def build_unified_mask(row_ids: np.ndarray, rate: float, percentiles: np.ndarray | None = None) -> np.ndarray:
+    threshold = hybrid_synth.unified_threshold_for_rate(rate)
+    if percentiles is None:
+        percentiles = build_unified_percentiles(row_ids)
+    return percentiles < threshold
 
 
 def write_neighbors(path: Path, qids: np.ndarray, all_neighbors: list[np.ndarray]) -> None:
@@ -79,26 +94,32 @@ def _resolve_train_files(src: Path, train_file: str | None, train_glob: str | No
     return [src / (train_file or "shuffle_train.parquet")]
 
 
-def _stream_train(files: list[Path], target_rows: int) -> tuple[np.ndarray, int]:
-    """Read up to target_rows rows of `emb` from the file list into a single
-    contiguous float32 array. target_rows<=0 means read all."""
-    chunks: list[np.ndarray] = []
+def _stream_train(files: list[Path], target_rows: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """Read up to target_rows of id+emb. target_rows<=0 means read all."""
+    embedding_chunks: list[np.ndarray] = []
+    id_chunks: list[np.ndarray] = []
     total = 0
     for f in files:
         log.info("loading %s", f)
-        tbl = pq.read_table(f, columns=["emb"])
+        tbl = pq.read_table(f, columns=["id", "emb"])
         rows = tbl.num_rows
         take = rows if target_rows <= 0 else min(rows, target_rows - total)
         if take <= 0:
             break
         emb = np.stack(tbl.slice(0, take).column("emb").to_numpy(zero_copy_only=False)).astype(np.float32, copy=False)
-        chunks.append(emb)
+        embedding_chunks.append(emb)
+        id_chunks.append(np.asarray(tbl.slice(0, take).column("id").to_numpy()).astype(np.int64))
         total += take
         log.info("  +%d rows (running total=%d)", take, total)
         if target_rows > 0 and total >= target_rows:
             break
-    arr = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
-    return arr, total
+    embeddings = (
+        np.concatenate(embedding_chunks, axis=0)
+        if len(embedding_chunks) > 1
+        else embedding_chunks[0]
+    )
+    row_ids = np.concatenate(id_chunks, axis=0) if len(id_chunks) > 1 else id_chunks[0]
+    return embeddings, row_ids, total
 
 
 def _normalize_rows(x: np.ndarray) -> np.ndarray:
@@ -112,6 +133,7 @@ def _topk_filtered(
     mask: np.ndarray,
     k: int,
     chunk: int = 200_000,
+    candidate_ids: np.ndarray | None = None,
 ) -> list[np.ndarray]:
     """Compute filtered top-k cosine for every test row.
 
@@ -138,7 +160,11 @@ def _topk_filtered(
 
         # Merge with running best_sims/best_ids.
         merged_sims = np.concatenate([best_sims, sims], axis=1)
-        sub_ids = np.arange(start, end, dtype=np.int64)
+        sub_ids = (
+            np.arange(start, end, dtype=np.int64)
+            if candidate_ids is None
+            else candidate_ids[start:end]
+        )
         merged_ids = np.concatenate(
             [best_ids, np.broadcast_to(sub_ids, (n_test, sub_ids.size))],
             axis=1,
@@ -171,6 +197,65 @@ def _topk_filtered(
     return out
 
 
+def _topk_filtered_many(
+    train_norm: np.ndarray,
+    test_norm: np.ndarray,
+    masks: dict[str, np.ndarray],
+    k: int,
+    chunk: int = 200_000,
+    candidate_ids: np.ndarray | None = None,
+) -> dict[str, list[np.ndarray]]:
+    """Compute many filtered GT sets in one similarity scan.
+
+    Matrix multiplication dominates GT construction. Reusing each chunk's
+    similarity matrix across all selectivities/modes makes a grid run much
+    closer to the cost of one GT than N independent runs.
+    """
+    n_train = train_norm.shape[0]
+    n_test = test_norm.shape[0]
+    state = {
+        name: (
+            np.full((n_test, k), -np.inf, dtype=np.float32),
+            np.full((n_test, k), -1, dtype=np.int64),
+        )
+        for name in masks
+    }
+
+    for start in range(0, n_train, chunk):
+        end = min(start + chunk, n_train)
+        sims = test_norm @ train_norm[start:end].T
+        sub_ids = (
+            np.arange(start, end, dtype=np.int64)
+            if candidate_ids is None
+            else candidate_ids[start:end]
+        )
+        broadcast_ids = np.broadcast_to(sub_ids, (n_test, sub_ids.size))
+        rows_idx = np.arange(n_test)[:, None]
+
+        for name, mask in masks.items():
+            best_sims, best_ids = state[name]
+            sub_mask = mask[start:end]
+            filtered_sims = sims if sub_mask.all() else np.where(sub_mask[None, :], sims, -np.inf)
+            merged_sims = np.concatenate([best_sims, filtered_sims], axis=1)
+            merged_ids = np.concatenate([best_ids, broadcast_ids], axis=1)
+            part = np.argpartition(-merged_sims, k - 1, axis=1)[:, :k]
+            state[name] = (merged_sims[rows_idx, part], merged_ids[rows_idx, part])
+
+        if start % (chunk * 5) == 0 or end == n_train:
+            log.info("  scanned %d / %d rows for %d GT sets", end, n_train, len(masks))
+
+    result: dict[str, list[np.ndarray]] = {}
+    for name, (best_sims, best_ids) in state.items():
+        rows: list[np.ndarray] = []
+        for i in range(n_test):
+            order = np.argsort(-best_sims[i])
+            sorted_sims = best_sims[i][order]
+            sorted_ids = best_ids[i][order]
+            rows.append(sorted_ids[sorted_sims > -np.inf])
+        result[name] = rows
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="source bioasq directory")
@@ -188,10 +273,10 @@ def main() -> None:
         nargs="*",
         type=float,
         default=None,
-        help="rate values in (0,1]; default: all from hybrid_synth.RATE_DENOMS",
+        help="rate values in (0,1]; defaults to each mode's configured grid",
     )
     ap.add_argument(
-        "--modes", nargs="*", choices=["array", "join"], default=["array", "join"],
+        "--modes", nargs="*", choices=["join", "unified"], default=["unified"],
     )
     ap.add_argument("--chunks-per-doc", type=int, default=hybrid_synth.CHUNKS_PER_DOC)
     ap.add_argument("--gt-chunk", type=int, default=200_000,
@@ -217,11 +302,10 @@ def main() -> None:
     test_emb = np.stack(test_tbl.column("emb").to_numpy(zero_copy_only=False)).astype(np.float32)
     test_norm = _normalize_rows(test_emb)
 
-    train_emb, n_train = _stream_train(train_files, args.train_size)
+    train_emb, train_ids, n_train = _stream_train(train_files, args.train_size)
     log.info("train loaded: %d rows, dim=%d, dtype=%s", n_train, train_emb.shape[1], train_emb.dtype)
 
     if not args.skip_train_write:
-        train_ids = np.arange(n_train, dtype=np.int64)
         out_train = pa.table({
             "id": pa.array(train_ids, type=pa.int64()),
             "emb": pa.array(list(train_emb), type=pa.list_(pa.float32(), train_emb.shape[1])),
@@ -242,35 +326,56 @@ def main() -> None:
     train_norm = _normalize_rows(train_emb)
     del train_emb
 
+    masks: dict[str, np.ndarray] = {}
+    output_paths: dict[str, Path] = {}
+    unified_percentiles = build_unified_percentiles(train_ids) if "unified" in args.modes else None
     if not args.skip_full_gt:
-        log.info("computing full (unfiltered) GT")
-        full_mask = np.ones(n_train, dtype=bool)
-        full_neighbors = _topk_filtered(train_norm, test_norm, full_mask, args.topk, chunk=args.gt_chunk)
-        write_neighbors(dst / "neighbors.parquet", test_ids, full_neighbors)
+        masks["full"] = np.ones(n_train, dtype=bool)
+        output_paths["full"] = dst / "neighbors.parquet"
 
-    denoms = (
-        list(hybrid_synth.RATE_DENOMS)
-        if args.rates is None
-        else [int(round(1.0 / r)) for r in args.rates]
-    )
     for mode in args.modes:
-        for d in denoms:
-            rate = 1.0 / d
+        if args.rates is not None:
+            mode_rates = args.rates
+        elif mode == "unified":
+            mode_rates = [threshold / 10_000 for threshold in hybrid_synth.UNIFIED_RATE_THRESHOLDS]
+        else:
+            mode_rates = [1.0 / d for d in hybrid_synth.RATE_DENOMS]
+        for rate in mode_rates:
             label = _rate_label(rate)
-            if mode == "array":
-                mask = build_array_mask(n_train, d)
+            if mode == "join":
+                d = int(round(1.0 / rate))
+                if abs(rate - 1.0 / d) > 1e-9:
+                    raise ValueError(f"legacy join mode requires rate=1/denom, got {rate}")
+                mask = build_join_mask(train_ids, d, args.chunks_per_doc)
+                output_name = f"neighbors_join_{label}.parquet"
             else:
-                mask = build_join_mask(n_train, d, args.chunks_per_doc)
-            log.info("computing GT mode=%s rate=%s denom=%d hits=%d", mode, label, d, int(mask.sum()))
-            outs = _topk_filtered(train_norm, test_norm, mask, args.topk, chunk=args.gt_chunk)
-            write_neighbors(dst / f"neighbors_{mode}_{label}.parquet", test_ids, outs)
+                # Scalar/Array/JSON predicates all use this exact mask and GT.
+                hybrid_synth.unified_rate_marker_for_rate(rate)
+                mask = build_unified_mask(train_ids, rate, unified_percentiles)
+                output_name = f"neighbors_hybrid_{label}.parquet"
+            key = f"{mode}:{label}"
+            masks[key] = mask
+            output_paths[key] = dst / output_name
+            log.info("prepared GT mode=%s rate=%s hits=%d", mode, label, int(mask.sum()))
+
+    log.info("computing %d GT sets in one similarity scan", len(masks))
+    all_neighbors = _topk_filtered_many(
+        train_norm,
+        test_norm,
+        masks,
+        args.topk,
+        chunk=args.gt_chunk,
+        candidate_ids=train_ids,
+    )
+    for key, neighbors in all_neighbors.items():
+        write_neighbors(output_paths[key], test_ids, neighbors)
 
 
 def _rate_label(rate: float) -> str:
-    r = rate * 100
-    if r >= 1:
-        return f"{int(round(r))}p"
-    return f"{r:.2f}p"
+    percent = rate * 100
+    if abs(percent - round(percent)) < 1e-9:
+        return f"{int(round(percent))}p"
+    return f"{percent:.2f}".rstrip("0").rstrip(".").replace(".", "_") + "p"
 
 
 if __name__ == "__main__":
