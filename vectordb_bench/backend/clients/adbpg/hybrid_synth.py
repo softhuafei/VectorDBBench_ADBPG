@@ -26,13 +26,15 @@ ARRAY_FILLER_LEN = 45
 CHUNKS_PER_DOC = 10
 DOC_TAGS_CARDINALITY = 10_000
 DOC_TAGS_FILLER_LEN = 15
+FILTER_DOMAIN_SIZE = 100_000
+HYBRID_QUERY_COUNT = 500
 
 # Each marker hits exactly 1/denom of the corpus.
 RATE_DENOMS = (2, 10, 100, 1_000, 10_000)
 
 # RBO boundary experiments focus on medium/high selectivities. Markers are
-# nested: a row at percentile 1,500 belongs to every threshold above 1,500.
-UNIFIED_RATE_THRESHOLDS = (
+# nested: a row selected at 0.1% is also selected at every higher rate.
+UNIFIED_RATE_BASIS_POINTS = (
     10,
     100,
     500,
@@ -49,6 +51,7 @@ UNIFIED_RATE_THRESHOLDS = (
     8_000,
     9_000,
 )
+UNIFIED_RATES = tuple(basis_points / 10_000 for basis_points in UNIFIED_RATE_BASIS_POINTS)
 
 
 def _h(*parts: object) -> int:
@@ -76,28 +79,50 @@ def rate_marker_for_rate(rate: float) -> str:
 
 
 def filter_percentile_for(row_id: int) -> int:
-    """Stable percentile bucket in [0, 10000), independent of Python hash."""
-    return _h("filter-v1", row_id) % 10_000
+    """Stable percentile bucket in [0, 100000), independent of Python hash."""
+    return _h("filter-v1", row_id) % FILTER_DOMAIN_SIZE
 
 
 def unified_threshold_for_rate(rate: float) -> int:
-    threshold = int(round(rate * 10_000))
-    if not 0 < threshold <= 10_000 or abs(rate - threshold / 10_000) > 1e-9:
-        raise ValueError(f"rate must be representable in basis points and in (0, 1], got {rate}")
+    threshold = round(rate * FILTER_DOMAIN_SIZE)
+    if (
+        not 0 < threshold <= FILTER_DOMAIN_SIZE
+        or abs(rate - threshold / FILTER_DOMAIN_SIZE) > 1e-9
+    ):
+        msg = f"rate must be representable in 1/{FILTER_DOMAIN_SIZE} units and in (0, 1], got {rate}"
+        raise ValueError(msg)
     return threshold
 
 
+def _basis_points_for_rate(rate: float) -> int:
+    basis_points = round(rate * 10_000)
+    if abs(rate - basis_points / 10_000) > 1e-9:
+        msg = f"rate must be representable in basis points, got {rate}"
+        raise ValueError(msg)
+    return basis_points
+
+
 def unified_rate_marker_for_rate(rate: float) -> str:
-    threshold = unified_threshold_for_rate(rate)
-    if threshold not in UNIFIED_RATE_THRESHOLDS:
-        supported = [threshold / 10_000 for threshold in UNIFIED_RATE_THRESHOLDS]
-        raise ValueError(f"unsupported unified rate {rate}; supported: {supported}")
-    return f"r_{threshold}bp"
+    unified_threshold_for_rate(rate)
+    if not any(abs(rate - supported_rate) < 1e-9 for supported_rate in UNIFIED_RATES):
+        supported = list(UNIFIED_RATES)
+        msg = f"unsupported unified rate {rate}; supported: {supported}"
+        raise ValueError(msg)
+    return f"r_{_basis_points_for_rate(rate)}bp"
 
 
 def unified_rate_markers_for_id(row_id: int) -> list[str]:
     percentile = filter_percentile_for(row_id)
-    return [f"r_{threshold}bp" for threshold in UNIFIED_RATE_THRESHOLDS if percentile < threshold]
+    return [
+        f"r_{basis_points}bp"
+        for rate, basis_points in zip(UNIFIED_RATES, UNIFIED_RATE_BASIS_POINTS, strict=True)
+        if percentile < unified_threshold_for_rate(rate)
+    ]
+
+
+def hybrid_query_score(query_id: int) -> int:
+    """Stable score used to select and order the fixed hybrid query set."""
+    return _h("hybrid-query-v1", query_id)
 
 
 def unified_user_array_for(

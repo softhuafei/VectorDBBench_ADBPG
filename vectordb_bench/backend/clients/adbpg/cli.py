@@ -184,7 +184,10 @@ class AdbpgTypedDict(CommonTypedDict):
         click.option(
             "--nova-build-optimize-level",
             type=int,
-            help="fastann.nova_build_optimize_level: 3=THP+graph opt (needs /mnt/nova_thp), 2=graph opt only (local dev)",
+            help=(
+                "fastann.nova_build_optimize_level: 3=THP+graph opt "
+                "(needs /mnt/nova_thp), 2=graph opt only (local dev)"
+            ),
             default=3,
             show_default=True,
             required=False,
@@ -197,6 +200,17 @@ class AdbpgTypedDict(CommonTypedDict):
             type=click.Choice(["none", "join", "unified"]),
             help="Hybrid-search schema flavor",
             default="none",
+            show_default=True,
+            required=False,
+        ),
+    ]
+    hybrid_storage: Annotated[
+        str,
+        click.option(
+            "--hybrid-storage",
+            type=click.Choice(["distributed", "master_only"]),
+            help="Physical placement for hybrid tables",
+            default="distributed",
             show_default=True,
             required=False,
         ),
@@ -244,6 +258,13 @@ class AdbpgTypedDict(CommonTypedDict):
 def AdbpgNova(**parameters: Unpack[AdbpgTypedDict]):
     from .config import AdbpgConfig, AdbpgIndexConfig
 
+    if parameters["hybrid_storage"] == "master_only" and parameters["load"]:
+        raise click.UsageError(
+            "master-only data preparation must use "
+            "scripts/prepare_hybrid_master_only.py; run the benchmark with "
+            "--skip-load --skip-drop-old",
+        )
+
     parameters["custom_case"] = get_custom_case_config(parameters)
     run(
         db=DB.Adbpg,
@@ -272,6 +293,7 @@ def AdbpgNova(**parameters: Unpack[AdbpgTypedDict]):
             topk_amp=parameters["topk_amp"],
             nova_build_optimize_level=parameters["nova_build_optimize_level"],
             hybrid_mode=parameters["hybrid_mode"],
+            hybrid_storage=parameters["hybrid_storage"],
             nova_topk_amp_mul=parameters["nova_topk_amp_mul"],
             nova_topk_amp_add=parameters["nova_topk_amp_add"],
             force_plan=parameters["force_plan"],

@@ -77,6 +77,11 @@ class TestAdbpgConfig:
         assert cc["dbname"] == "postgres"
         assert cc["options"] == "-c gp_session_role=utility"
 
+    def test_hybrid_storage_defaults_to_distributed(self):
+        cfg = make_index_config(hybrid_mode="unified")
+        assert cfg.hybrid_storage == "distributed"
+        assert make_index_config(hybrid_storage="master_only").hybrid_storage == "master_only"
+
 
 class TestAdbpgIndexConfigBuild:
     def test_parse_metric(self):

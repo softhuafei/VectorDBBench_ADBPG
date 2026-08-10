@@ -4,28 +4,35 @@ from vectordb_bench.backend.clients.adbpg import hybrid_synth
 def test_unified_percentile_is_stable_and_bounded():
     values = [hybrid_synth.filter_percentile_for(i) for i in range(100)]
     assert values == [hybrid_synth.filter_percentile_for(i) for i in range(100)]
-    assert all(0 <= value < 10_000 for value in values)
+    assert all(0 <= value < 100_000 for value in values)
 
 
 def test_scalar_array_json_truth_sets_are_identical():
-    rate = 0.2
-    threshold = hybrid_synth.unified_threshold_for_rate(rate)
-    marker = hybrid_synth.unified_rate_marker_for_rate(rate)
+    for rate in (0.001, 0.01):
+        threshold = hybrid_synth.unified_threshold_for_rate(rate)
+        marker = hybrid_synth.unified_rate_marker_for_rate(rate)
 
-    for row_id in range(1_000):
-        scalar_hit = hybrid_synth.filter_percentile_for(row_id) < threshold
-        array_hit = marker in hybrid_synth.unified_user_array_for(row_id, filler_len=0)
-        json_hit = marker in hybrid_synth.unified_payload_for(row_id)["rates"]
-        assert scalar_hit == array_hit == json_hit
+        for row_id in range(10_000):
+            scalar_hit = hybrid_synth.filter_percentile_for(row_id) < threshold
+            array_hit = marker in hybrid_synth.unified_user_array_for(row_id, filler_len=0)
+            json_hit = marker in hybrid_synth.unified_payload_for(row_id)["rates"]
+            assert scalar_hit == array_hit == json_hit
+
+
+def test_low_rate_thresholds_and_markers():
+    assert hybrid_synth.unified_threshold_for_rate(0.001) == 100
+    assert hybrid_synth.unified_threshold_for_rate(0.01) == 1_000
+    assert hybrid_synth.unified_rate_marker_for_rate(0.001) == "r_10bp"
+    assert hybrid_synth.unified_rate_marker_for_rate(0.01) == "r_100bp"
 
 
 def test_unified_truth_sets_are_nested():
-    marker_20 = hybrid_synth.unified_rate_marker_for_rate(0.2)
-    marker_30 = hybrid_synth.unified_rate_marker_for_rate(0.3)
-    for row_id in range(1_000):
+    marker_low = hybrid_synth.unified_rate_marker_for_rate(0.001)
+    marker_high = hybrid_synth.unified_rate_marker_for_rate(0.01)
+    for row_id in range(10_000):
         markers = hybrid_synth.unified_rate_markers_for_id(row_id)
-        if marker_20 in markers:
-            assert marker_30 in markers
+        if marker_low in markers:
+            assert marker_high in markers
 
 
 def test_unified_filters_share_groundtruth_file():
@@ -36,7 +43,7 @@ def test_unified_filters_share_groundtruth_file():
     )
 
     filters = [
-        PercentileLTFilter(filter_rate=0.2, threshold=2_000),
+        PercentileLTFilter(filter_rate=0.2, threshold=20_000),
         ArrayContainsFilter(filter_rate=0.2, values=["r_2000bp"]),
         JsonContainsFilter(filter_rate=0.2, marker="r_2000bp"),
     ]

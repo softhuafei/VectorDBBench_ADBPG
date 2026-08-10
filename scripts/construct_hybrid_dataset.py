@@ -2,7 +2,7 @@
 
 Reads a Bioasq-like dataset (train.parquet with id+emb, test.parquet with
 id+emb) and writes:
-  - shuffle_train.parquet  (re-keyed copy / subset of input)
+  - shuffle_train.parquet  (optional streamed copy / subset of input)
   - test.parquet           (copy / subset of input)
   - neighbors.parquet      (full GT)
   - neighbors_hybrid_<rate>.parquet shared by scalar/array/json filters
@@ -36,21 +36,25 @@ Usage
 from __future__ import annotations
 
 import argparse
-import glob as _glob
+import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 # Prefer this checkout over an older globally installed vectordb_bench.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+import numpy as np  # noqa: E402
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
 
-from vectordb_bench.backend.clients.adbpg import hybrid_synth
+from vectordb_bench.backend.clients.adbpg import hybrid_synth  # noqa: E402
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 log = logging.getLogger("construct_hybrid")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -85,41 +89,59 @@ def write_neighbors(path: Path, qids: np.ndarray, all_neighbors: list[np.ndarray
     log.info("wrote %s (%d rows)", path, len(qids))
 
 
+def select_hybrid_queries(test_tbl: pa.Table, test_size: int) -> pa.Table:
+    """Select the stable 500-query hybrid set, then take a quick-test prefix."""
+    query_ids = np.asarray(test_tbl.column("id").to_numpy()).astype(np.int64)
+    if len(np.unique(query_ids)) != len(query_ids):
+        raise ValueError("test query ids must be unique")
+    order = sorted(
+        range(len(query_ids)),
+        key=lambda index: (
+            hybrid_synth.hybrid_query_score(int(query_ids[index])),
+            int(query_ids[index]),
+        ),
+    )
+    fixed_count = min(hybrid_synth.HYBRID_QUERY_COUNT, len(order))
+    selected = test_tbl.take(pa.array(order[:fixed_count], type=pa.int64()))
+    if test_size > 0:
+        selected = selected.slice(0, min(test_size, fixed_count))
+    return selected
+
+
 def _resolve_train_files(src: Path, train_file: str | None, train_glob: str | None) -> list[Path]:
     if train_glob:
-        files = sorted(Path(p) for p in _glob.glob(str(src / train_glob)))
+        files = sorted(path for path in src.glob(train_glob) if path.is_file())
         if not files:
-            raise FileNotFoundError(f"--train-glob '{train_glob}' matched 0 files under {src}")
+            msg = f"--train-glob '{train_glob}' matched 0 files under {src}"
+            raise FileNotFoundError(msg)
         return files
     return [src / (train_file or "shuffle_train.parquet")]
 
 
-def _stream_train(files: list[Path], target_rows: int) -> tuple[np.ndarray, np.ndarray, int]:
-    """Read up to target_rows of id+emb. target_rows<=0 means read all."""
-    embedding_chunks: list[np.ndarray] = []
-    id_chunks: list[np.ndarray] = []
+def _iter_train_batches(
+    files: list[Path],
+    target_rows: int,
+    batch_size: int,
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield id and embedding arrays without retaining earlier Parquet batches."""
     total = 0
-    for f in files:
-        log.info("loading %s", f)
-        tbl = pq.read_table(f, columns=["id", "emb"])
-        rows = tbl.num_rows
-        take = rows if target_rows <= 0 else min(rows, target_rows - total)
-        if take <= 0:
-            break
-        emb = np.stack(tbl.slice(0, take).column("emb").to_numpy(zero_copy_only=False)).astype(np.float32, copy=False)
-        embedding_chunks.append(emb)
-        id_chunks.append(np.asarray(tbl.slice(0, take).column("id").to_numpy()).astype(np.int64))
-        total += take
-        log.info("  +%d rows (running total=%d)", take, total)
-        if target_rows > 0 and total >= target_rows:
-            break
-    embeddings = (
-        np.concatenate(embedding_chunks, axis=0)
-        if len(embedding_chunks) > 1
-        else embedding_chunks[0]
-    )
-    row_ids = np.concatenate(id_chunks, axis=0) if len(id_chunks) > 1 else id_chunks[0]
-    return embeddings, row_ids, total
+    for path in files:
+        log.info("streaming %s", path)
+        parquet = pq.ParquetFile(path)
+        for batch in parquet.iter_batches(batch_size=batch_size, columns=["id", "emb"]):
+            table = pa.Table.from_batches([batch])
+            take = table.num_rows if target_rows <= 0 else min(table.num_rows, target_rows - total)
+            if take <= 0:
+                return
+            table = table.slice(0, take)
+            row_ids = np.asarray(table.column("id").to_numpy()).astype(np.int64)
+            embeddings = np.stack(
+                table.column("emb").to_numpy(zero_copy_only=False),
+            ).astype(np.float32, copy=False)
+            yield embeddings, row_ids
+            total += take
+            if target_rows > 0 and total >= target_rows:
+                return
 
 
 def _normalize_rows(x: np.ndarray) -> np.ndarray:
@@ -127,156 +149,128 @@ def _normalize_rows(x: np.ndarray) -> np.ndarray:
     return (x / n).astype(np.float32, copy=False)
 
 
-def _topk_filtered(
-    train_norm: np.ndarray,
+def _merge_topk_batch(
+    state: dict[str, tuple[np.ndarray, np.ndarray]],
     test_norm: np.ndarray,
-    mask: np.ndarray,
-    k: int,
-    chunk: int = 200_000,
-    candidate_ids: np.ndarray | None = None,
-) -> list[np.ndarray]:
-    """Compute filtered top-k cosine for every test row.
-
-    Streams chunks of train rows; per chunk, masks out non-matching rows
-    by setting their similarity to -inf, then merges into a running
-    per-test top-k via partial sort. Memory: O(chunk*test_rows + n_test*k).
-    """
-    n_train = train_norm.shape[0]
-    n_test = test_norm.shape[0]
-
-    # Per-test running top-k buffers (sims, ids).
-    best_sims = np.full((n_test, k), -np.inf, dtype=np.float32)
-    best_ids = np.full((n_test, k), -1, dtype=np.int64)
-
-    for start in range(0, n_train, chunk):
-        end = min(start + chunk, n_train)
-        sub = train_norm[start:end]
-        sub_mask = mask[start:end]
-        # (n_test, sub) similarity
-        sims = test_norm @ sub.T  # already normalized
-        # Mask out non-matching rows so they cannot make the top-k.
-        if not sub_mask.all():
-            sims[:, ~sub_mask] = -np.inf
-
-        # Merge with running best_sims/best_ids.
-        merged_sims = np.concatenate([best_sims, sims], axis=1)
-        sub_ids = (
-            np.arange(start, end, dtype=np.int64)
-            if candidate_ids is None
-            else candidate_ids[start:end]
-        )
-        merged_ids = np.concatenate(
-            [best_ids, np.broadcast_to(sub_ids, (n_test, sub_ids.size))],
-            axis=1,
-        )
-
-        # argpartition to keep top-k.
-        if merged_sims.shape[1] > k:
-            part = np.argpartition(-merged_sims, k - 1, axis=1)[:, :k]
-            rows_idx = np.arange(n_test)[:, None]
-            best_sims = merged_sims[rows_idx, part]
-            best_ids = merged_ids[rows_idx, part]
-        else:
-            best_sims = merged_sims
-            best_ids = merged_ids
-
-        if start % (chunk * 5) == 0 or end == n_train:
-            log.info("  scanned %d / %d rows", end, n_train)
-
-    # Final sort by descending similarity per test row. Drop -inf entries
-    # (which correspond to test rows whose mask had < k hits).
-    out: list[np.ndarray] = []
-    for i in range(n_test):
-        sims = best_sims[i]
-        ids = best_ids[i]
-        order = np.argsort(-sims)
-        sims = sims[order]
-        ids = ids[order]
-        valid = sims > -np.inf
-        out.append(ids[valid])
-    return out
-
-
-def _topk_filtered_many(
     train_norm: np.ndarray,
-    test_norm: np.ndarray,
+    candidate_ids: np.ndarray,
     masks: dict[str, np.ndarray],
     k: int,
-    chunk: int = 200_000,
-    candidate_ids: np.ndarray | None = None,
+) -> None:
+    """Merge one train batch into every filtered running top-k."""
+    sims = test_norm @ train_norm.T
+    broadcast_ids = np.broadcast_to(candidate_ids, (test_norm.shape[0], candidate_ids.size))
+    rows_idx = np.arange(test_norm.shape[0])[:, None]
+
+    for name, mask in masks.items():
+        best_sims, best_ids = state[name]
+        filtered_sims = sims if mask.all() else np.where(mask[None, :], sims, -np.inf)
+        merged_sims = np.concatenate([best_sims, filtered_sims], axis=1)
+        merged_ids = np.concatenate([best_ids, broadcast_ids], axis=1)
+        part = np.argpartition(-merged_sims, k - 1, axis=1)[:, :k]
+        state[name] = (merged_sims[rows_idx, part], merged_ids[rows_idx, part])
+
+
+def _finish_topk_state(
+    state: dict[str, tuple[np.ndarray, np.ndarray]],
 ) -> dict[str, list[np.ndarray]]:
-    """Compute many filtered GT sets in one similarity scan.
-
-    Matrix multiplication dominates GT construction. Reusing each chunk's
-    similarity matrix across all selectivities/modes makes a grid run much
-    closer to the cost of one GT than N independent runs.
-    """
-    n_train = train_norm.shape[0]
-    n_test = test_norm.shape[0]
-    state = {
-        name: (
-            np.full((n_test, k), -np.inf, dtype=np.float32),
-            np.full((n_test, k), -1, dtype=np.int64),
-        )
-        for name in masks
-    }
-
-    for start in range(0, n_train, chunk):
-        end = min(start + chunk, n_train)
-        sims = test_norm @ train_norm[start:end].T
-        sub_ids = (
-            np.arange(start, end, dtype=np.int64)
-            if candidate_ids is None
-            else candidate_ids[start:end]
-        )
-        broadcast_ids = np.broadcast_to(sub_ids, (n_test, sub_ids.size))
-        rows_idx = np.arange(n_test)[:, None]
-
-        for name, mask in masks.items():
-            best_sims, best_ids = state[name]
-            sub_mask = mask[start:end]
-            filtered_sims = sims if sub_mask.all() else np.where(sub_mask[None, :], sims, -np.inf)
-            merged_sims = np.concatenate([best_sims, filtered_sims], axis=1)
-            merged_ids = np.concatenate([best_ids, broadcast_ids], axis=1)
-            part = np.argpartition(-merged_sims, k - 1, axis=1)[:, :k]
-            state[name] = (merged_sims[rows_idx, part], merged_ids[rows_idx, part])
-
-        if start % (chunk * 5) == 0 or end == n_train:
-            log.info("  scanned %d / %d rows for %d GT sets", end, n_train, len(masks))
-
     result: dict[str, list[np.ndarray]] = {}
     for name, (best_sims, best_ids) in state.items():
         rows: list[np.ndarray] = []
-        for i in range(n_test):
-            order = np.argsort(-best_sims[i])
-            sorted_sims = best_sims[i][order]
-            sorted_ids = best_ids[i][order]
+        for query_index in range(best_sims.shape[0]):
+            order = np.lexsort((best_ids[query_index], -best_sims[query_index]))
+            sorted_sims = best_sims[query_index][order]
+            sorted_ids = best_ids[query_index][order]
             rows.append(sorted_ids[sorted_sims > -np.inf])
         result[name] = rows
     return result
 
 
-def main() -> None:
+def _stream_topk_filtered_many(
+    train_files: list[Path],
+    test_norm: np.ndarray,
+    mask_builders: dict[str, Callable[[np.ndarray], np.ndarray]],
+    k: int,
+    target_rows: int,
+    batch_size: int,
+    train_output_path: Path | None = None,
+) -> tuple[dict[str, list[np.ndarray]], dict[str, int], int]:
+    """Compute all filtered GT sets in one true streaming Parquet scan."""
+    state = {
+        name: (
+            np.full((test_norm.shape[0], k), -np.inf, dtype=np.float32),
+            np.full((test_norm.shape[0], k), -1, dtype=np.int64),
+        )
+        for name in mask_builders
+    }
+    hit_counts = dict.fromkeys(mask_builders, 0)
+    total = 0
+    writer: pq.ParquetWriter | None = None
+    try:
+        for embeddings, row_ids in _iter_train_batches(train_files, target_rows, batch_size):
+            if train_output_path is not None:
+                output_table = pa.table({
+                    "id": pa.array(row_ids, type=pa.int64()),
+                    "emb": pa.array(
+                        list(embeddings),
+                        type=pa.list_(pa.float32(), embeddings.shape[1]),
+                    ),
+                })
+                if writer is None:
+                    writer = pq.ParquetWriter(train_output_path, output_table.schema, compression="zstd")
+                writer.write_table(output_table)
+
+            masks = {name: builder(row_ids) for name, builder in mask_builders.items()}
+            for name, mask in masks.items():
+                hit_counts[name] += int(mask.sum())
+            _merge_topk_batch(
+                state,
+                test_norm,
+                _normalize_rows(embeddings),
+                row_ids,
+                masks,
+                k,
+            )
+            total += len(row_ids)
+            log.info("  scanned %d rows for %d GT sets", total, len(mask_builders))
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if total == 0:
+        raise ValueError("no train rows were read")
+    return _finish_topk_state(state), hit_counts, total
+
+
+def main() -> None:  # noqa: PLR0915
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="source bioasq directory")
     ap.add_argument("--dst", required=True, help="destination directory")
-    ap.add_argument("--train-file", default=None)
-    ap.add_argument("--train-glob", default=None,
-                    help="glob (relative to --src) matching multiple train shards")
+    train_input = ap.add_mutually_exclusive_group()
+    train_input.add_argument("--train-file", default=None)
+    train_input.add_argument(
+        "--train-glob",
+        default=None,
+        help="glob (relative to --src) matching multiple train shards",
+    )
     ap.add_argument("--test-file", default="test.parquet")
-    ap.add_argument("--gt-file", default="neighbors.parquet")
     ap.add_argument("--train-size", type=int, default=0, help="0 = full")
-    ap.add_argument("--test-size", type=int, default=0, help="0 = full")
-    ap.add_argument("--topk", type=int, default=100)
+    ap.add_argument(
+        "--test-size",
+        type=int,
+        default=0,
+        help="0 = fixed 500-query set; N > 0 = first N queries from that fixed set",
+    )
+    ap.add_argument("--topk", type=int, default=1_000)
     ap.add_argument(
         "--rates",
-        nargs="*",
+        nargs="+",
         type=float,
         default=None,
         help="rate values in (0,1]; defaults to each mode's configured grid",
     )
     ap.add_argument(
-        "--modes", nargs="*", choices=["join", "unified"], default=["unified"],
+        "--modes", nargs="+", choices=["join", "unified"], default=["unified"],
     )
     ap.add_argument("--chunks-per-doc", type=int, default=hybrid_synth.CHUNKS_PER_DOC)
     ap.add_argument("--gt-chunk", type=int, default=200_000,
@@ -286,6 +280,12 @@ def main() -> None:
     ap.add_argument("--skip-full-gt", action="store_true",
                     help="skip writing unfiltered neighbors.parquet")
     args = ap.parse_args()
+    if args.train_size < 0 or args.test_size < 0:
+        ap.error("--train-size and --test-size must be non-negative")
+    if args.topk < 1 or args.gt_chunk < 1:
+        ap.error("--topk and --gt-chunk must be positive")
+    if args.rates is not None and any(not 0 < rate <= 1 for rate in args.rates):
+        ap.error("every --rates value must be in (0, 1]")
 
     src = Path(args.src)
     dst = Path(args.dst)
@@ -296,85 +296,92 @@ def main() -> None:
 
     log.info("loading test %s", test_path)
     test_tbl = pq.read_table(test_path)
-    n_test = test_tbl.num_rows if args.test_size <= 0 else min(args.test_size, test_tbl.num_rows)
-    test_tbl = test_tbl.slice(0, n_test)
-    test_ids = np.asarray(test_tbl.column("id").to_numpy()).astype(np.int64)[:n_test]
+    test_tbl = select_hybrid_queries(test_tbl, args.test_size)
+    test_ids = np.asarray(test_tbl.column("id").to_numpy()).astype(np.int64)
     test_emb = np.stack(test_tbl.column("emb").to_numpy(zero_copy_only=False)).astype(np.float32)
     test_norm = _normalize_rows(test_emb)
-
-    train_emb, train_ids, n_train = _stream_train(train_files, args.train_size)
-    log.info("train loaded: %d rows, dim=%d, dtype=%s", n_train, train_emb.shape[1], train_emb.dtype)
-
-    if not args.skip_train_write:
-        out_train = pa.table({
-            "id": pa.array(train_ids, type=pa.int64()),
-            "emb": pa.array(list(train_emb), type=pa.list_(pa.float32(), train_emb.shape[1])),
-        })
-        out_path = dst / "shuffle_train.parquet"
-        pq.write_table(out_train, str(out_path), compression="zstd")
-        log.info("wrote %s (%d rows)", out_path, n_train)
 
     out_test = pa.table({
         "id": pa.array(test_ids, type=pa.int64()),
         "emb": pa.array(list(test_emb), type=pa.list_(pa.float32(), test_emb.shape[1])),
     })
     pq.write_table(out_test, str(dst / "test.parquet"), compression="zstd")
-    log.info("wrote %s (%d rows)", dst / "test.parquet", n_test)
+    (dst / "query_ids.json").write_text(
+        json.dumps(test_ids.tolist(), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    log.info("wrote %s (%d rows)", dst / "test.parquet", len(test_ids))
 
-    # Pre-normalize train rows so chunked dot products yield cosine sim.
-    log.info("normalizing %d train rows", n_train)
-    train_norm = _normalize_rows(train_emb)
-    del train_emb
-
-    masks: dict[str, np.ndarray] = {}
+    mask_builders: dict[str, Callable[[np.ndarray], np.ndarray]] = {}
     output_paths: dict[str, Path] = {}
-    unified_percentiles = build_unified_percentiles(train_ids) if "unified" in args.modes else None
     if not args.skip_full_gt:
-        masks["full"] = np.ones(n_train, dtype=bool)
+        mask_builders["full"] = lambda row_ids: np.ones(len(row_ids), dtype=bool)
         output_paths["full"] = dst / "neighbors.parquet"
 
+    selected_rates: dict[str, list[float]] = {}
     for mode in args.modes:
         if args.rates is not None:
             mode_rates = args.rates
         elif mode == "unified":
-            mode_rates = [threshold / 10_000 for threshold in hybrid_synth.UNIFIED_RATE_THRESHOLDS]
+            mode_rates = list(hybrid_synth.UNIFIED_RATES)
         else:
             mode_rates = [1.0 / d for d in hybrid_synth.RATE_DENOMS]
+        selected_rates[mode] = list(mode_rates)
         for rate in mode_rates:
             label = _rate_label(rate)
+            key = f"{mode}:{label}"
             if mode == "join":
-                d = int(round(1.0 / rate))
+                d = round(1.0 / rate)
                 if abs(rate - 1.0 / d) > 1e-9:
-                    raise ValueError(f"legacy join mode requires rate=1/denom, got {rate}")
-                mask = build_join_mask(train_ids, d, args.chunks_per_doc)
+                    msg = f"legacy join mode requires rate=1/denom, got {rate}"
+                    raise ValueError(msg)
+                mask_builders[key] = (
+                    lambda row_ids, denom=d: build_join_mask(row_ids, denom, args.chunks_per_doc)
+                )
                 output_name = f"neighbors_join_{label}.parquet"
             else:
                 # Scalar/Array/JSON predicates all use this exact mask and GT.
                 hybrid_synth.unified_rate_marker_for_rate(rate)
-                mask = build_unified_mask(train_ids, rate, unified_percentiles)
+                mask_builders[key] = (
+                    lambda row_ids, filter_rate=rate: build_unified_mask(row_ids, filter_rate)
+                )
                 output_name = f"neighbors_hybrid_{label}.parquet"
-            key = f"{mode}:{label}"
-            masks[key] = mask
             output_paths[key] = dst / output_name
-            log.info("prepared GT mode=%s rate=%s hits=%d", mode, label, int(mask.sum()))
+            log.info("prepared GT mode=%s rate=%s", mode, label)
 
-    log.info("computing %d GT sets in one similarity scan", len(masks))
-    all_neighbors = _topk_filtered_many(
-        train_norm,
+    log.info("computing %d GT sets in one streaming similarity scan", len(mask_builders))
+    all_neighbors, hit_counts, n_train = _stream_topk_filtered_many(
+        train_files,
         test_norm,
-        masks,
+        mask_builders,
         args.topk,
-        chunk=args.gt_chunk,
-        candidate_ids=train_ids,
+        args.train_size,
+        args.gt_chunk,
+        None if args.skip_train_write else dst / "shuffle_train.parquet",
     )
     for key, neighbors in all_neighbors.items():
         write_neighbors(output_paths[key], test_ids, neighbors)
+        log.info("GT %s hits=%d", key, hit_counts[key])
+
+    metadata = {
+        "train_rows": n_train,
+        "query_rows": len(test_ids),
+        "query_selection": "hybrid-query-v1",
+        "filter_domain_size": hybrid_synth.FILTER_DOMAIN_SIZE,
+        "modes": list(args.modes),
+        "rates": selected_rates,
+        "topk": args.topk,
+    }
+    (dst / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _rate_label(rate: float) -> str:
     percent = rate * 100
     if abs(percent - round(percent)) < 1e-9:
-        return f"{int(round(percent))}p"
+        return f"{round(percent)}p"
     return f"{percent:.2f}".rstrip("0").rstrip(".").replace(".", "_") + "p"
 
 

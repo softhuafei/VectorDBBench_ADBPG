@@ -86,6 +86,9 @@ class AdbpgIndexConfig(BaseModel, DBCaseConfig):
     #   join  - two-table model with chunk.pipeline_doc_id joining doc.tags.
     #   unified - percentile/array/json columns derived from the same truth set.
     hybrid_mode: str = "none"
+    # Physical placement for hybrid tables. master_only uses an entry-table
+    # policy, so all data and indexes live on the coordinator.
+    hybrid_storage: str = "distributed"
     doc_table_name: str = "doc_table"
     doc_join_field: str = "pipeline_doc_id"
     doc_tags_field: str = "tags"

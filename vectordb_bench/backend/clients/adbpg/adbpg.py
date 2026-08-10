@@ -2,10 +2,8 @@
 
 import json
 import logging
-import os
-import time
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 import numpy as np
@@ -75,6 +73,9 @@ class Adbpg(VectorDB):
 
         # Hybrid-search state: schema flavor.
         self.hybrid_mode = getattr(self.case_config, "hybrid_mode", "none")
+        self.hybrid_storage = getattr(self.case_config, "hybrid_storage", "distributed")
+        if self.hybrid_storage == "master_only" and self.hybrid_mode != "unified":
+            raise ValueError("hybrid_storage=master_only currently requires hybrid_mode=unified")
 
         # Hybrid JOIN and unified benchmarks must use the dispatcher so rows
         # are physically distributed across primary segments. Utility mode
@@ -84,6 +85,9 @@ class Adbpg(VectorDB):
 
         # construct basic units
         self.conn, self.cursor = self._create_connection(**self.connect_config)
+
+        if self.hybrid_storage == "master_only" and not drop_old:
+            self._validate_master_only_table()
 
         log.info(f"{self.name} config values: {self.connect_config}\n{self.case_config}")
         if not any(
@@ -356,7 +360,8 @@ class Adbpg(VectorDB):
             create_sql = sql.SQL(
                 f"""
                 CREATE TABLE IF NOT EXISTS public.{{table_name}}
-                ({{primary_field}} BIGINT PRIMARY KEY, embedding vector({{dim}}){label_column}{''.join(extra_columns)}){dist_clause};
+                ({{primary_field}} BIGINT PRIMARY KEY,
+                 embedding vector({{dim}}){label_column}{''.join(extra_columns)}){dist_clause};
                 """,
             ).format(
                 table_name=sql.Identifier(self.table_name),
@@ -364,6 +369,7 @@ class Adbpg(VectorDB):
                 dim=dim,
             )
             self.cursor.execute(create_sql)
+
 
             self.cursor.execute(
                 sql.SQL(
@@ -379,6 +385,22 @@ class Adbpg(VectorDB):
             log.warning(f"Failed to create adbpg table: {self.table_name} error: {e}")
             raise e from None
 
+    def _validate_master_only_table(self) -> None:
+        """Require an existing coordinator-local table for a master-only run."""
+        assert self.cursor is not None
+        qualified = f"public.{self.table_name}"
+        self.cursor.execute("SELECT to_regclass(%s)", (qualified,))
+        if self.cursor.fetchone()[0] is None:
+            msg = f"{qualified} does not exist; run scripts/prepare_hybrid_master_only.py first"
+            raise RuntimeError(msg)
+        self.cursor.execute(
+            "SELECT EXISTS (SELECT 1 FROM gp_distribution_policy WHERE localoid = %s::regclass)",
+            (qualified,),
+        )
+        if self.cursor.fetchone()[0]:
+            msg = f"{qualified} is distributed; prepare a master-only table before running this benchmark"
+            raise RuntimeError(msg)
+
     def _create_doc_table(self):
         """Create the doc-side table for the 2-table JOIN scenario."""
         assert self.cursor is not None
@@ -388,7 +410,9 @@ class Adbpg(VectorDB):
         log.info(f"{self.name} create doc table {doc}")
         self.cursor.execute(
             sql.SQL(
-                "CREATE TABLE IF NOT EXISTS public.{doc} ({join_field} BIGINT PRIMARY KEY, {tags_field} TEXT[]) DISTRIBUTED BY ({join_field})",
+                "CREATE TABLE IF NOT EXISTS public.{doc} "
+                "({join_field} BIGINT PRIMARY KEY, {tags_field} TEXT[]) "
+                "DISTRIBUTED BY ({join_field})",
             ).format(
                 doc=sql.Identifier(doc),
                 join_field=sql.Identifier(join_field),
@@ -552,10 +576,8 @@ class Adbpg(VectorDB):
             self.conn.commit()
         except Exception as e:
             log.warning(f"Pre-test EXPLAIN failed: {e}")
-            try:
+            with suppress(Exception):
                 self.conn.rollback()
-            except Exception:
-                pass
 
     def search_embedding(
         self,
